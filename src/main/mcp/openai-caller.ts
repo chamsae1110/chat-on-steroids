@@ -36,19 +36,12 @@ const MAX_REQUEST_BINDINGS = 50_000;
 const processKey = randomBytes(32);
 const bindings = new Map<string, string | null>();
 const callerByRequest = new Map<string, string | null>();
-const bootstrap = new Map<string, { waiterClaimed: boolean }>();
-const bindingWaiters = new Map<string, Set<() => void>>();
-
-function wakeBinding(key: string): void {
-  const waiters = bindingWaiters.get(key);
-  if (!waiters) return;
-  bindingWaiters.delete(key);
-  for (const resolve of waiters) resolve();
-}
+const bootstrap = new Set<string>();
+const executionByWireRequest = new Map<string, Promise<unknown>>();
 
 function poison(key: string): void {
   bindings.set(key, null);
-  wakeBinding(key);
+  bootstrap.delete(key);
 }
 
 function opaque(value: unknown, present: boolean): OpaqueField {
@@ -138,7 +131,7 @@ export function bindOpenAiCaller(key: string | null, conversationId: string | nu
   if (!key || !conversationId) return false;
   if (!bindings.has(key)) {
     bindings.set(key, conversationId);
-    wakeBinding(key);
+    bootstrap.delete(key);
     return true;
   }
   const held = bindings.get(key) ?? null;
@@ -156,46 +149,51 @@ export function openAiCallerNeedsPageEvidence(key: string | null): boolean {
   return Boolean(key && !bindings.has(key));
 }
 
-export type OpenAiBootstrapPhase = 'first' | 'waiter' | 'duplicate' | 'resolved';
+export type OpenAiBootstrapPhase = 'first' | 'pending' | 'resolved';
 
 /**
- * Allows one immediate no-execution response and one coalesced waiter per
- * unbound official caller. ChatGPT can fan one logical tool call out to several
- * concurrent HTTP requests; only the waiter may proceed after page evidence,
- * preventing duplicate filesystem mutations.
+ * Marks every replica of an unbound official caller as no-execution bootstrap.
+ *
+ * ChatGPT does not publish the page-side request id until its entire gateway
+ * fanout has received a result. Holding one replica open while waiting for that
+ * page evidence therefore deadlocks the evidence behind the response itself.
+ * Every unbound replica must return immediately; once the rendered page binds
+ * this session, the model's later retry enters as `resolved` and may execute.
  */
 export function beginOpenAiCallerBootstrap(key: string | null): OpenAiBootstrapPhase {
   if (!key || bindings.has(key)) return 'resolved';
-  const state = bootstrap.get(key);
-  if (!state) {
-    bootstrap.set(key, { waiterClaimed: false });
-    return 'first';
-  }
-  if (!state.waiterClaimed) {
-    state.waiterClaimed = true;
-    return 'waiter';
-  }
-  return 'duplicate';
+  if (bootstrap.has(key)) return 'pending';
+  bootstrap.add(key);
+  return 'first';
 }
 
-export async function awaitOpenAiCallerConversation(key: string | null, timeoutMs: number): Promise<string | null> {
-  if (!key) return null;
-  const immediate = conversationForOpenAiCaller(key);
-  if (immediate || openAiCallerConflicted(key) || timeoutMs <= 0) return immediate;
-  let timer: NodeJS.Timeout | null = null;
-  await new Promise<void>((resolve) => {
-    const waiters = bindingWaiters.get(key) ?? new Set<() => void>();
-    waiters.add(resolve);
-    bindingWaiters.set(key, waiters);
-    timer = setTimeout(() => {
-      waiters.delete(resolve);
-      if (waiters.size === 0) bindingWaiters.delete(key);
-      resolve();
-    }, timeoutMs);
-    timer.unref?.();
-  });
-  if (timer) clearTimeout(timer);
-  return conversationForOpenAiCaller(key);
+/**
+ * Executes one official logical MCP request once across concurrent HTTP replicas.
+ *
+ * ChatGPT's gateway can fan the same JSON-RPC request over several HTTP requests.
+ * The exact caller key, page-join request id and JSON-RPC id together identify that
+ * logical request without trusting a model-provided argument or collapsing distinct
+ * calls in one assistant turn. Followers receive the leader's exact result; the entry
+ * disappears when the leader settles, so a later request cannot replay stale output.
+ */
+export function coalesceOpenAiCallerExecution<T>(
+  key: string | null,
+  requestId: string | null,
+  wireRequestId: string | null,
+  run: () => Promise<T>
+): Promise<T> {
+  if (!key || !requestId || !wireRequestId) return run();
+  const executionKey = `${key}\0${requestId}\0${wireRequestId}`;
+  const existing = executionByWireRequest.get(executionKey) as Promise<T> | undefined;
+  if (existing) return existing;
+  const leader = Promise.resolve().then(run);
+  executionByWireRequest.set(executionKey, leader);
+  void leader.finally(() => {
+    if (executionByWireRequest.get(executionKey) === leader) {
+      executionByWireRequest.delete(executionKey);
+    }
+  }).catch(() => undefined);
+  return leader;
 }
 
 /**
@@ -239,5 +237,5 @@ export function resetOpenAiCallerBindingsForTests(): void {
   bindings.clear();
   callerByRequest.clear();
   bootstrap.clear();
-  bindingWaiters.clear();
+  executionByWireRequest.clear();
 }

@@ -3,7 +3,7 @@ import {
   bindOpenAiCaller,
   bindOpenAiCallerForRequest,
   beginOpenAiCallerBootstrap,
-  awaitOpenAiCallerConversation,
+  coalesceOpenAiCallerExecution,
   conversationForOpenAiCaller,
   openAiCallerConflicted,
   openAiHeaderEvidence,
@@ -114,18 +114,43 @@ describe('OpenAI MCP caller identity', () => {
     expect(openAiCallerConflicted(two.key)).toBe(true);
   });
 
-  it('admits one bootstrap response and one waiter while classifying extra gateway replicas as duplicates', async () => {
+  it('keeps every unbound gateway replica in immediate no-execution bootstrap until page evidence binds it', () => {
     const identity = resolveOpenAiCallerIdentity(
       undefined,
       openAiHeaderEvidence({ 'x-openai-session': 'fanout-session', 'x-openai-subject': 'fanout-subject' })
     );
     expect(beginOpenAiCallerBootstrap(identity.key)).toBe('first');
-    expect(beginOpenAiCallerBootstrap(identity.key)).toBe('waiter');
-    expect(beginOpenAiCallerBootstrap(identity.key)).toBe('duplicate');
+    expect(beginOpenAiCallerBootstrap(identity.key)).toBe('pending');
+    expect(beginOpenAiCallerBootstrap(identity.key)).toBe('pending');
 
-    const waiting = awaitOpenAiCallerConversation(identity.key, 1_000);
     expect(bindOpenAiCaller(identity.key, 'conversation-fanout')).toBe(true);
-    await expect(waiting).resolves.toBe('conversation-fanout');
     expect(beginOpenAiCallerBootstrap(identity.key)).toBe('resolved');
+  });
+
+  it('coalesces only concurrent replicas of the same exact official wire request', async () => {
+    const identity = resolveOpenAiCallerIdentity(
+      undefined,
+      openAiHeaderEvidence({ 'x-openai-session': 'singleflight-session', 'x-openai-subject': 'subject' })
+    );
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let executions = 0;
+    const run = async () => {
+      executions += 1;
+      await held;
+      return { execution: executions };
+    };
+    const replicas = Array.from({ length: 6 }, () =>
+      coalesceOpenAiCallerExecution(identity.key, 'wfr_singleflight', 's:rpc-7', run)
+    );
+    await Promise.resolve();
+    expect(executions).toBe(1);
+    release();
+    await expect(Promise.all(replicas)).resolves.toEqual(Array.from({ length: 6 }, () => ({ execution: 1 })));
+
+    await coalesceOpenAiCallerExecution(identity.key, 'wfr_singleflight', 's:rpc-8', run);
+    expect(executions).toBe(2);
   });
 });

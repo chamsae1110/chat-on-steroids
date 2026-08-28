@@ -1829,12 +1829,14 @@ describe('through the MCP endpoint', () => {
     subject: string,
     name: string,
     args: Record<string, unknown>,
-    meta = false
-  ): Promise<any> =>
-    post(
+    meta = false,
+    wireRequestId: string | number | null = null
+  ): Promise<any> => {
+    const jsonRpcId = wireRequestId ?? nextId++;
+    return post(
       {
         jsonrpc: '2.0',
-        id: nextId++,
+        id: jsonRpcId,
         method: 'tools/call',
         params: {
           name,
@@ -1848,6 +1850,7 @@ describe('through the MCP endpoint', () => {
         'x-openai-subject': subject
       }
     );
+  };
 
   const textOfReply = (reply: any): string =>
     ((reply.result?.content ?? []) as Array<{ text?: string }>).map((part) => part.text ?? '').join('\n');
@@ -2150,7 +2153,7 @@ describe('through the MCP endpoint', () => {
     expect(text).toMatch(/unknown root|not found/i);
   });
 
-  it('coalesces gateway fanout so one replica waits for page identity and only that replica executes', async () => {
+  it('releases every bootstrap replica before the page join and executes only the later retry', async () => {
     startSwarm(1);
     const worker = startWorker('worker-1');
     finishAgent(worker.caller, 'park before a fanned-out prime call');
@@ -2159,12 +2162,16 @@ describe('through the MCP endpoint', () => {
     const requestId = 'wfr_openai_gateway_fanout';
     const session = 'openai-session-gateway-fanout';
     const subject = 'openai-subject-user';
-    const first = await ordinaryAsOpenAiCaller(requestId, session, subject, 'read', { paths: ['/anything'] });
-    expect(textOfReply(first)).toContain('CALLER_IDENTITY_PENDING');
-
-    const waiter = ordinaryAsOpenAiCaller(requestId, session, subject, 'read', { paths: ['/anything'] });
-    const duplicate = await ordinaryAsOpenAiCaller(requestId, session, subject, 'read', { paths: ['/anything'] });
-    expect(textOfReply(duplicate)).toContain('CALLER_IDENTITY_PENDING');
+    const replicas = await Promise.all(
+      Array.from({ length: 6 }, () =>
+        ordinaryAsOpenAiCaller(requestId, session, subject, 'read', { paths: ['/anything'] }, false, 'bootstrap-1')
+      )
+    );
+    expect(replicas).toHaveLength(6);
+    for (const replica of replicas) {
+      expect(textOfReply(replica)).toContain('CALLER_IDENTITY_PENDING');
+      expect(textOfReply(replica)).toContain('without running a local tool');
+    }
     await recordChatObservations('c-openai-gateway-fanout', [
       { kind: 'turn_start', time: Date.now(), turnId: 't-openai-gateway-fanout' },
       {
@@ -2174,9 +2181,15 @@ describe('through the MCP endpoint', () => {
         calls: [{ messageId: 'm-openai-gateway-fanout', tool: 'read', order: 0, answered: false, requestId }]
       }
     ]);
-    const executed = textOfReply(await waiter);
-    expect(executed).not.toContain('CALLER_IDENTITY_PENDING');
-    expect(executed).toMatch(/unknown root|not found/i);
+    const executedReplicas = await Promise.all(
+      Array.from({ length: 6 }, () =>
+        ordinaryAsOpenAiCaller(requestId, session, subject, 'read', { paths: ['/anything'] }, false, 'retry-2')
+      )
+    );
+    for (const executed of executedReplicas.map(textOfReply)) {
+      expect(executed).not.toContain('CALLER_IDENTITY_PENDING');
+      expect(executed).toMatch(/unknown root|not found/i);
+    }
   });
 
   it('binds an old worker official session to that worker and keeps it fenced', async () => {

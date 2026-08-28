@@ -24,8 +24,8 @@ import { inboundOpenAiHeaders, inboundRequestId } from './inbound.js';
 import { McpServer, type ServerContext } from '@modelcontextprotocol/server';
 import {
   bindOpenAiCaller,
-  awaitOpenAiCallerConversation,
   beginOpenAiCallerBootstrap,
+  coalesceOpenAiCallerExecution,
   conversationForOpenAiCaller,
   noteOpenAiCallerRequest,
   openAiCallerConflicted,
@@ -268,6 +268,13 @@ function callerConversation(tool: string, startedAt: number, requestId: string |
 /** Transport context consumed without adding any model-controlled identity argument. */
 type McpCallContext = Pick<ServerContext, 'sessionId' | 'mcpReq'>;
 
+function wireRequestIdOf(mcpCtx: McpCallContext | undefined): string | null {
+  const value = mcpCtx?.mcpReq?.id;
+  if (typeof value === 'string' && value.length > 0 && value.length <= 200) return `s:${value}`;
+  if (typeof value === 'number' && Number.isFinite(value)) return `n:${value}`;
+  return null;
+}
+
 /**
  * ChatGPT's id for this request, from `x-request-id`, without the per-attempt suffix.
  *
@@ -375,6 +382,7 @@ async function dispatch(
   args: unknown,
   transportKey: string | null,
   requestId: string | null,
+  wireRequestId: string | null,
   openAiCaller: OpenAiCallerIdentity,
   surface: SurfaceId,
   run: () => Promise<ToolResult>
@@ -395,7 +403,7 @@ async function dispatch(
   };
   return trackMcpRequest(() =>
     trackInFlight(context, () =>
-      dispatchTracked(context, name, args, transportKey, requestId, openAiCaller, surface, run)
+      dispatchTracked(context, name, args, transportKey, requestId, wireRequestId, openAiCaller, surface, run)
     )
   );
 }
@@ -406,6 +414,7 @@ async function dispatchTracked(
   args: unknown,
   transportKey: string | null,
   requestId: string | null,
+  wireRequestId: string | null,
   openAiCaller: OpenAiCallerIdentity,
   surface: SurfaceId,
   run: () => Promise<ToolResult>
@@ -443,13 +452,13 @@ async function dispatchTracked(
     return conversationId;
   };
   if (requestConversation) context.caller.conversationId = acceptRequestConversation(requestConversation);
-  // The page cannot publish metadata.request_id until it has a connector result to render.
-  // Waiting here deadlocks that evidence behind the HTTP response and eventually turns a
-  // fail-closed local refusal into ChatGPT's opaque 502. A valid official OpenAI session lets
-  // us make the bootstrap deterministic without trusting it yet: return one no-execution
-  // result immediately, let the extension join this exact request id to its page, and accept
-  // only a later call after that join has bound the session. An old dormant worker follows the
-  // same path, binds to its old conversation, and is then fenced as WORKER_SLEEPING.
+  // The page cannot publish metadata.request_id until the complete gateway fanout has a
+  // connector result to render. A waiter inside that fanout therefore blocks the evidence it
+  // is waiting for: live, five immediate replicas and one 30-second waiter all returned
+  // PENDING, and the exact page join appeared only after the waiter had ended. Return every
+  // unbound replica without execution. The rendered page then binds this official session,
+  // and only a later model retry may run. An old dormant worker follows the same path, binds
+  // to its old conversation, and is fenced as WORKER_SLEEPING.
   const bootstrapPhase =
     !callerIdentityConflict &&
     !context.caller.conversationId &&
@@ -457,15 +466,7 @@ async function dispatchTracked(
     openAiCaller.key
       ? beginOpenAiCallerBootstrap(openAiCaller.key)
       : 'resolved';
-  if (bootstrapPhase === 'waiter') {
-    context.caller.conversationId = await awaitOpenAiCallerConversation(
-      openAiCaller.key,
-      OPENAI_BOOTSTRAP_EVIDENCE_MS
-    );
-  }
-  const callerIdentityPending =
-    bootstrapPhase === 'first' || bootstrapPhase === 'duplicate' ||
-    (bootstrapPhase === 'waiter' && !context.caller.conversationId);
+  const callerIdentityPending = bootstrapPhase !== 'resolved';
   // Only calls that need an *existing* per-chat workspace before the handler runs are
   // identity-sensitive here. An absolute read or an exec with an explicit absolute workdir is
   // self-contained and must stay fast; if its exact page mate is late, workspace.ts simply
@@ -598,7 +599,7 @@ async function dispatchTracked(
               'CALLER_IDENTITY_REQUIRED: this operation needs this chat’s exact workspace, but the connector could not prove which ChatGPT conversation made the call. Retry after the extension reconnects; no file or command was changed.'
             )
           )
-        : run()
+        : coalesceOpenAiCallerExecution(openAiCaller.key, requestId, wireRequestId, run)
   );
   // Identity, once, from this call's own evidence — see callerConversation. `agents` has
   // already established its own inside the call and adopted it, and re-reading here would
@@ -898,7 +899,7 @@ export function createRegistrar(server: McpServer, ctx: ToolContext, surface: Su
       // surface declared: who is calling is a fact about the conversation, established from
       // page evidence in `dispatch`, and never something the model is asked to carry.
       server.registerTool(name, config, ((args: never, mcpCtx?: McpCallContext) =>
-        dispatch(name, args, mcpCtx?.sessionId ?? null, requestIdOf(mcpCtx), openAiCallerOf(mcpCtx), surface, () =>
+        dispatch(name, args, mcpCtx?.sessionId ?? null, requestIdOf(mcpCtx), wireRequestIdOf(mcpCtx), openAiCallerOf(mcpCtx), surface, () =>
           handler(args)
         )) as never);
     },
@@ -972,13 +973,6 @@ export const DORMANT_HISTORY_EVIDENCE_CEILING_MS = 50_000;
 export const DORMANT_HISTORY_EVIDENCE_MS = evidenceWindow(
   DORMANT_HISTORY_EVIDENCE_CEILING_MS,
   process.env.CLF_DORMANT_HISTORY_EVIDENCE_MS ?? process.env.CLF_EVIDENCE_MS
-);
-
-/** One coalesced gateway replica may wait briefly for the first rendered page join. */
-export const OPENAI_BOOTSTRAP_EVIDENCE_CEILING_MS = 30_000;
-export const OPENAI_BOOTSTRAP_EVIDENCE_MS = evidenceWindow(
-  OPENAI_BOOTSTRAP_EVIDENCE_CEILING_MS,
-  process.env.CLF_OPENAI_BOOTSTRAP_EVIDENCE_MS ?? process.env.CLF_DORMANT_HISTORY_EVIDENCE_MS ?? process.env.CLF_EVIDENCE_MS
 );
 
 /**
