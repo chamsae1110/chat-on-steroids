@@ -2212,6 +2212,7 @@ describe('through the MCP endpoint', () => {
     }));
     const runId = '20260829T020304Z-abcdef654321';
     const token = 'OracleGrant_abcdefghijklmnopqrstuvwxyz_0123456789-ABCDEFG';
+    const bootstrapUri = `oracle://core/${runId}/${token}`;
     const session = 'official-oracle-grant-session';
     const mission = path.join(dir, 'oracle-grant-mission.md');
     const codexHome = path.join(dir, 'oracle-grant-codex-home');
@@ -2219,9 +2220,8 @@ describe('through the MCP endpoint', () => {
     const sha = (value: string): string => createHash('sha256').update(value).digest('hex');
     await fs.writeFile(mission, 'ORACLE_GRANT_MISSION_OK\n', 'utf8');
     await fs.mkdir(runDir, { recursive: true });
-    await fs.writeFile(
-      path.join(runDir, 'caller-identity-grant.json'),
-      `${JSON.stringify({
+    const grantPath = path.join(runDir, 'caller-identity-grant.json');
+    const grantBytes = `${JSON.stringify({
         schema: 'codex.chatgpt.oracle-core-caller-grant/v1',
         run_id: runId,
         source_thread_id: '01a029cc-d9e3-7e42-8f3b-1a96f48da540',
@@ -2233,15 +2233,28 @@ describe('through the MCP endpoint', () => {
         model: 'gpt-5.6-sol',
         thinking_time: 'pro',
         token_sha256: sha(token),
+        bootstrap_uri_sha256: sha(bootstrapUri),
         created_at_ms: Date.now(),
         expires_at_ms: Date.now() + 10 * 60_000
+      }, null, 2)}\n`;
+    await fs.writeFile(grantPath, grantBytes, 'utf8');
+    await fs.writeFile(
+      path.join(runDir, 'state.json'),
+      `${JSON.stringify({
+        run_id: runId,
+        status: 'running',
+        session_authority: 'submitted_unknown',
+        app_name: 'Chat On Steroids Core',
+        transport: 'pro-devspace',
+        profile: { model: 'gpt-5.6-sol', thinking_time: 'pro' },
+        core_caller_grant: { path: await fs.realpath(grantPath), sha256: sha(grantBytes) }
       }, null, 2)}\n`,
       'utf8'
     );
     const priorCodexHome = process.env['CODEX_HOME'];
     process.env['CODEX_HOME'] = codexHome;
     try {
-      const args = { paths: [mission], oracle_run_id: runId, oracle_token: token };
+      const args = { paths: [bootstrapUri] };
       const replicas = await Promise.all(
         Array.from({ length: 6 }, () =>
           ordinaryAsOpenAiCaller(

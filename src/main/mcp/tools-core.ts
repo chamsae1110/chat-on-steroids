@@ -259,26 +259,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               .optional()
               .describe(
                 `Per-text-file payload cap. Default ${formatBytes(DEFAULT_READ_BYTES)}; maximum ${formatBytes(MAX_READ_BYTES)}. Omit it for ordinary source files.`
-              ),
-            oracle_run_id: z
-              .string()
-              .regex(/^\d{8}T\d{6}Z-[0-9a-f]{12}$/)
-              .optional()
-              .describe('Oracle-opened fresh conversation only: exact run id supplied by the controller for the first mission read.'),
-            oracle_token: z
-              .string()
-              .regex(/^[A-Za-z0-9_-]{32,256}$/)
-              .optional()
-              .describe('Oracle-opened fresh conversation only: one-use controller token for the first exact mission read. Never repeat or quote it.')
-          })
-          .superRefine((input, refinement) => {
-            if ((input.oracle_run_id === undefined) !== (input.oracle_token === undefined)) {
-              refinement.addIssue({
-                code: 'custom',
-                path: [],
-                message: 'oracle_run_id and oracle_token must be supplied together'
-              });
-            }
+              )
           })
           .strict(),
         annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }

@@ -19,6 +19,7 @@ describe('Oracle fresh Prime caller grants', () => {
   let runDir = '';
   let projectRoot = '';
   let missionPath = '';
+  let bootstrapUri = '';
 
   beforeEach(async () => {
     resetOracleCallerGrantsForTests();
@@ -27,12 +28,12 @@ describe('Oracle fresh Prime caller grants', () => {
     runDir = path.join(stateRoot, 'projects', 'project-key', 'runs', RUN_ID);
     projectRoot = path.join(temp, 'project');
     missionPath = path.join(projectRoot, 'mission.md');
+    bootstrapUri = `oracle://core/${RUN_ID}/${TOKEN}`;
     await fs.mkdir(runDir, { recursive: true });
     await fs.mkdir(projectRoot, { recursive: true });
     await fs.writeFile(missionPath, 'grant mission\n', 'utf8');
-    await fs.writeFile(
-      path.join(runDir, 'caller-identity-grant.json'),
-      `${JSON.stringify({
+    const grantPath = path.join(runDir, 'caller-identity-grant.json');
+    const grantBytes = `${JSON.stringify({
         schema: 'codex.chatgpt.oracle-core-caller-grant/v1',
         run_id: RUN_ID,
         source_thread_id: '01a029cc-d9e3-7e42-8f3b-1a96f48da540',
@@ -44,8 +45,24 @@ describe('Oracle fresh Prime caller grants', () => {
         model: 'gpt-5.6-sol',
         thinking_time: 'pro',
         token_sha256: sha(TOKEN),
+        bootstrap_uri_sha256: sha(bootstrapUri),
         created_at_ms: Date.now(),
         expires_at_ms: Date.now() + 10 * 60_000
+      }, null, 2)}\n`;
+    await fs.writeFile(grantPath, grantBytes, 'utf8');
+    await fs.writeFile(
+      path.join(runDir, 'state.json'),
+      `${JSON.stringify({
+        run_id: RUN_ID,
+        status: 'running',
+        session_authority: 'submitted_unknown',
+        app_name: 'Chat On Steroids Core',
+        transport: 'pro-devspace',
+        profile: { model: 'gpt-5.6-sol', thinking_time: 'pro' },
+        core_caller_grant: {
+          path: await fs.realpath(grantPath),
+          sha256: sha(grantBytes)
+        }
       }, null, 2)}\n`,
       'utf8'
     );
@@ -56,8 +73,8 @@ describe('Oracle fresh Prime caller grants', () => {
     await fs.rm(temp, { recursive: true, force: true });
   });
 
-  const claim = (callerKey = 'caller-a', token = TOKEN, paths = [missionPath]) =>
-    claimOracleReadGrant({ callerKey, runId: RUN_ID, token, requestedPaths: paths, stateRoot });
+  const claim = (callerKey = 'caller-a', token = TOKEN, uri = bootstrapUri) =>
+    claimOracleReadGrant({ callerKey, runId: RUN_ID, token, bootstrapUri: uri, stateRoot });
 
   it('consumes one exact hash-bound mission grant without persisting the raw token', async () => {
     const result = await claim();
@@ -80,11 +97,11 @@ describe('Oracle fresh Prime caller grants', () => {
     });
   });
 
-  it('rejects a wrong token, wrong mission path, changed mission, and a second caller', async () => {
+  it('rejects a wrong token, wrong bootstrap URI, changed mission, and a second caller', async () => {
     await expect(claim('caller-a', `${TOKEN}x`)).resolves.toMatchObject({ ok: false, code: 'ORACLE_CALLER_GRANT_TOKEN_MISMATCH' });
-    await expect(claim('caller-a', TOKEN, [path.join(projectRoot, 'other.md')])).resolves.toMatchObject({
+    await expect(claim('caller-a', TOKEN, `${bootstrapUri}-other`)).resolves.toMatchObject({
       ok: false,
-      code: 'ORACLE_CALLER_GRANT_MISSION_MISMATCH'
+      code: 'ORACLE_CALLER_GRANT_URI_MISMATCH'
     });
     await fs.writeFile(missionPath, 'changed\n', 'utf8');
     await expect(claim()).resolves.toMatchObject({ ok: false, code: 'ORACLE_CALLER_GRANT_MISSION_CHANGED' });
@@ -97,5 +114,14 @@ describe('Oracle fresh Prime caller grants', () => {
     await expect(claim()).resolves.toMatchObject({ ok: true });
     resetOracleCallerGrantsForTests();
     await expect(claim()).resolves.toMatchObject({ ok: false, code: 'ORACLE_CALLER_GRANT_ALREADY_CLAIMED' });
+  });
+
+  it('rejects a terminal Oracle run even when its unexpired token is known', async () => {
+    const statePath = path.join(runDir, 'state.json');
+    const state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+    state.status = 'attention_required';
+    state.session_authority = 'terminal';
+    await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+    await expect(claim()).resolves.toMatchObject({ ok: false, code: 'ORACLE_CALLER_GRANT_RUN_NOT_LIVE' });
   });
 });

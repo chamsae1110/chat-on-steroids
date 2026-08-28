@@ -91,7 +91,7 @@ async function readGrant(
   stateRoot: string,
   runId: string,
   token: string,
-  requestedPaths: readonly string[]
+  bootstrapUri: string
 ): Promise<{ grant: OracleCallerGrant; grantPath: string } | { code: string }> {
   if (!RUN_ID.test(runId) || !/^[A-Za-z0-9_-]{32,256}$/.test(token)) return { code: 'ORACLE_CALLER_GRANT_INPUT_INVALID' };
   const grantPath = await exactGrantPath(stateRoot, runId);
@@ -111,6 +111,9 @@ async function readGrant(
   const missionSha256 = typeof raw['mission_sha256'] === 'string' ? raw['mission_sha256'].toLowerCase() : '';
   const sourceThreadId = typeof raw['source_thread_id'] === 'string' ? raw['source_thread_id'] : '';
   const tokenSha256 = typeof raw['token_sha256'] === 'string' ? raw['token_sha256'].toLowerCase() : '';
+  const bootstrapUriSha256 = typeof raw['bootstrap_uri_sha256'] === 'string'
+    ? raw['bootstrap_uri_sha256'].toLowerCase()
+    : '';
   const createdAtMs = typeof raw['created_at_ms'] === 'number' ? raw['created_at_ms'] : NaN;
   const expiresAtMs = typeof raw['expires_at_ms'] === 'number' ? raw['expires_at_ms'] : NaN;
   const now = Date.now();
@@ -126,6 +129,7 @@ async function readGrant(
     !contained(projectRoot, missionPath) ||
     !SHA256.test(missionSha256) ||
     !SHA256.test(tokenSha256) ||
+    !SHA256.test(bootstrapUriSha256) ||
     !THREAD_ID.test(sourceThreadId) ||
     !Number.isSafeInteger(createdAtMs) ||
     !Number.isSafeInteger(expiresAtMs) ||
@@ -135,9 +139,7 @@ async function readGrant(
     expiresAtMs - createdAtMs > 60 * 60_000
   ) return { code: 'ORACLE_CALLER_GRANT_INVALID' };
   if (!safeEqualHex(digest(token), tokenSha256)) return { code: 'ORACLE_CALLER_GRANT_TOKEN_MISMATCH' };
-  if (requestedPaths.length !== 1 || path.resolve(requestedPaths[0] ?? '') !== missionPath) {
-    return { code: 'ORACLE_CALLER_GRANT_MISSION_MISMATCH' };
-  }
+  if (!safeEqualHex(digest(bootstrapUri), bootstrapUriSha256)) return { code: 'ORACLE_CALLER_GRANT_URI_MISMATCH' };
   try {
     if ((await fs.lstat(projectRoot)).isSymbolicLink() || (await fs.lstat(missionPath)).isSymbolicLink()) {
       return { code: 'ORACLE_CALLER_GRANT_MISSION_CHANGED' };
@@ -148,8 +150,25 @@ async function readGrant(
     if (!safeEqualHex(digest(await fs.readFile(missionPath)), missionSha256)) {
       return { code: 'ORACLE_CALLER_GRANT_MISSION_CHANGED' };
     }
+    const state = JSON.parse(await fs.readFile(path.join(path.dirname(grantPath), 'state.json'), 'utf8')) as Record<string, unknown>;
+    const reference = state['core_caller_grant'] as Record<string, unknown> | undefined;
+    const profile = state['profile'] as Record<string, unknown> | undefined;
+    const referencePath = typeof reference?.['path'] === 'string'
+      ? await fs.realpath(reference['path']).catch(() => '')
+      : '';
+    if (
+      state['run_id'] !== runId ||
+      state['status'] !== 'running' ||
+      state['session_authority'] !== 'submitted_unknown' ||
+      state['app_name'] !== 'Chat On Steroids Core' ||
+      state['transport'] !== 'pro-devspace' ||
+      profile?.['model'] !== 'gpt-5.6-sol' ||
+      profile?.['thinking_time'] !== 'pro' ||
+      referencePath !== grantPath ||
+      reference?.['sha256'] !== digest(bytes)
+    ) return { code: 'ORACLE_CALLER_GRANT_RUN_NOT_LIVE' };
   } catch {
-    return { code: 'ORACLE_CALLER_GRANT_MISSION_CHANGED' };
+    return { code: 'ORACLE_CALLER_GRANT_RUN_NOT_LIVE' };
   }
   return {
     grantPath,
@@ -169,7 +188,7 @@ async function claimOnce(
   callerKey: string,
   runId: string,
   token: string,
-  requestedPaths: readonly string[],
+  bootstrapUri: string,
   stateRoot: string
 ): Promise<OracleGrantClaimResult> {
   const held = grantByCaller.get(callerKey);
@@ -184,7 +203,7 @@ async function claimOnce(
       ? { ok: true, grant: grantByCaller.get(callerKey)! }
       : { ok: false, code: 'ORACLE_CALLER_GRANT_ALREADY_CLAIMED' };
   }
-  const read = await readGrant(stateRoot, runId, token, requestedPaths);
+  const read = await readGrant(stateRoot, runId, token, bootstrapUri);
   if ('code' in read) return { ok: false, code: read.code };
   const claimPath = path.join(path.dirname(read.grantPath), 'caller-identity-claim.json');
   const receipt = {
@@ -216,16 +235,16 @@ export function claimOracleReadGrant(input: {
   callerKey: string | null;
   runId: string;
   token: string;
-  requestedPaths: readonly string[];
+  bootstrapUri: string;
   stateRoot?: string;
 }): Promise<OracleGrantClaimResult> {
   if (!input.callerKey) return Promise.resolve({ ok: false, code: 'ORACLE_CALLER_IDENTITY_REQUIRED' });
   const stateRoot = path.resolve(input.stateRoot ?? defaultOracleStateRoot());
   const existing = claimFlights.get(input.runId);
   if (existing) {
-    return existing.then(() => claimOnce(input.callerKey!, input.runId, input.token, input.requestedPaths, stateRoot));
+    return existing.then(() => claimOnce(input.callerKey!, input.runId, input.token, input.bootstrapUri, stateRoot));
   }
-  const flight = claimOnce(input.callerKey, input.runId, input.token, input.requestedPaths, stateRoot);
+  const flight = claimOnce(input.callerKey, input.runId, input.token, input.bootstrapUri, stateRoot);
   claimFlights.set(input.runId, flight);
   void flight.finally(() => {
     if (claimFlights.get(input.runId) === flight) claimFlights.delete(input.runId);

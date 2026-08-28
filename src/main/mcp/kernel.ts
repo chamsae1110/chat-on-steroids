@@ -456,25 +456,36 @@ async function dispatchTracked(
   };
   if (requestConversation) context.caller.conversationId = acceptRequestConversation(requestConversation);
   const input = args && typeof args === 'object' ? (args as Record<string, unknown>) : {};
-  const oracleRunId = typeof input['oracle_run_id'] === 'string' ? input['oracle_run_id'] : null;
-  const oracleToken = typeof input['oracle_token'] === 'string' ? input['oracle_token'] : null;
-  const hasOracleClaim = oracleRunId !== null || oracleToken !== null;
+  const oraclePaths = Array.isArray(input['paths']) ? input['paths'] : [];
+  const oracleBootstrapUri = oraclePaths.length === 1 && typeof oraclePaths[0] === 'string' && oraclePaths[0].startsWith('oracle://')
+    ? oraclePaths[0]
+    : null;
+  const oracleBootstrapMatch = oracleBootstrapUri?.match(
+    /^oracle:\/\/core\/([0-9]{8}T[0-9]{6}Z-[0-9a-f]{12})\/([A-Za-z0-9_-]{32,256})$/
+  ) ?? null;
+  const hasOracleClaim = oracleBootstrapUri !== null;
   let oracleClaimError: string | null = null;
+  let claimedMissionPath: string | null = null;
   if (hasOracleClaim) {
-    if (name !== 'read' || !oracleRunId || !oracleToken || !Array.isArray(input['paths'])) {
+    if (name !== 'read' || !oracleBootstrapMatch) {
       oracleClaimError = 'ORACLE_CALLER_GRANT_INPUT_INVALID';
     } else if (callerIdentityConflict) {
       oracleClaimError = 'ORACLE_CALLER_IDENTITY_CONFLICT';
     } else {
       const claimed = await claimOracleReadGrant({
         callerKey: openAiCaller.key,
-        runId: oracleRunId,
-        token: oracleToken,
-        requestedPaths: input['paths'].filter((value): value is string => typeof value === 'string')
+        runId: oracleBootstrapMatch[1]!,
+        token: oracleBootstrapMatch[2]!,
+        bootstrapUri: oracleBootstrapUri!
       });
       if (!claimed.ok) oracleClaimError = claimed.code;
+      else claimedMissionPath = claimed.grant.missionPath;
     }
   }
+  // The handler receives the exact sealed project mission, never the capability-bearing
+  // bootstrap URI. Mutating this freshly parsed request object also guarantees that neither
+  // the tool summary nor the durable recorder can retain the one-use token.
+  if (claimedMissionPath) input['paths'] = [claimedMissionPath];
   const oracleGrant = oracleClaimError ? null : oracleGrantForCaller(openAiCaller.key);
   const oracleAuthorized = Boolean(oracleGrant && !callerIdentityConflict && !context.caller.conversationId);
   context.oracleProjectRoot = oracleAuthorized ? oracleGrant!.projectRoot : null;
@@ -689,10 +700,9 @@ async function dispatchTracked(
   // subtly earlier internal value that omits the worker report most likely to matter later.
   const delivered = withInbox(context.caller.conversationId, context.agent, result, isFinish);
   const recorderStartedAt = Date.now();
-  const recordedArgs =
-    args && typeof args === 'object' && Object.prototype.hasOwnProperty.call(args, 'oracle_token')
-      ? Object.fromEntries(Object.entries(args as Record<string, unknown>).filter(([key]) => key !== 'oracle_token'))
-      : args;
+  const recordedArgs = hasOracleClaim
+    ? { paths: claimedMissionPath ? [claimedMissionPath] : ['oracle://core/<redacted>'] }
+    : args;
   const recording = recordToolCall({
     tool: name,
     args: recordedArgs,
