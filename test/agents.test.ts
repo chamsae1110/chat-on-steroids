@@ -9,6 +9,7 @@
 
 import http from 'node:http';
 import { promises as fs } from 'node:fs';
+import path from 'node:path';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Caller } from '../src/main/agents.js';
 
@@ -2190,6 +2191,80 @@ describe('through the MCP endpoint', () => {
       expect(executed).not.toContain('CALLER_IDENTITY_PENDING');
       expect(executed).toMatch(/unknown root|not found|not inside an approved folder/i);
     }
+  });
+
+  it('uses an early exact page scope for the first six-replica call and executes that logical call once', async () => {
+    startSwarm(1);
+    const worker = startWorker('worker-1');
+    finishAgent(worker.caller, 'park before the early-scope prime call');
+    expect(releaseQuiescentRun()).toBe(true);
+
+    await endpoint.stop();
+    endpoint = await startMcpServer(() => ({
+      roots: [{ name: 'scope-probe', path: dir }],
+      caps: { ...DEFAULT_CAPABILITIES, command: true },
+      readOnly: false,
+      sessionTools: false,
+      agentTools: true
+    }));
+
+    // This is the exact live ordering from 2026-08-28: ChatGPT publishes one UUID-shaped
+    // conversation-scope request before the six Core HTTP replicas, while the replicas use
+    // a later wfr id that is not visible in the page model until they have all returned.
+    const session = 'bbf09ac8-787c-47e5-9693-9b3e88352f23';
+    const subject = 'openai-subject-early-scope';
+    await recordChatObservations('c-openai-early-scope', [
+      { kind: 'turn_start', time: Date.now(), turnId: 't-openai-early-scope' },
+      {
+        kind: 'tool_evidence',
+        time: Date.now(),
+        turnId: 't-openai-early-scope',
+        calls: [{ messageId: 'm-openai-early-scope', tool: '', order: 0, answered: false, requestId: session }]
+      }
+    ]);
+
+    const counter = path.join(dir, 'early-scope-fanout-counter.txt');
+    await fs.writeFile(counter, '', 'utf8');
+    const shell =
+      process.platform === 'win32'
+        ? `${process.env.SystemRoot ?? 'C:\\Windows'}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`
+        : '/bin/sh';
+    const command =
+      process.platform === 'win32'
+        ? `Add-Content -LiteralPath '${counter.replaceAll("'", "''")}' -Value 'once'; Start-Sleep -Milliseconds 300`
+        : `printf '%s\\n' once >> '${counter.replaceAll("'", "'\\''")}'; sleep 0.3`;
+    const args = { cmd: command, workdir: dir, shell, yield_time_ms: 30_000 };
+    const replicas = await Promise.all(
+      Array.from({ length: 6 }, () =>
+        ordinaryAsOpenAiCaller(
+          'wfr_01a04966174d77928fd46eb499e86c49',
+          session,
+          subject,
+          'exec_command',
+          args,
+          false,
+          'scope-logical-call-1'
+        )
+      )
+    );
+    for (const replica of replicas.map(textOfReply)) {
+      expect(replica).not.toContain('CALLER_IDENTITY_PENDING');
+      expect(replica).not.toContain('CALLER_IDENTITY_REQUIRED');
+    }
+    expect((await fs.readFile(counter, 'utf8')).trim().split(/\r?\n/)).toEqual(['once']);
+
+    // A distinct JSON-RPC id is a distinct logical call even in the same assistant turn.
+    // It must not replay the first result or be collapsed into the first operation.
+    await ordinaryAsOpenAiCaller(
+      'wfr_01a04966174d77928fd46eb499e86c49',
+      session,
+      subject,
+      'exec_command',
+      args,
+      false,
+      'scope-logical-call-2'
+    );
+    expect((await fs.readFile(counter, 'utf8')).trim().split(/\r?\n/)).toEqual(['once', 'once']);
   });
 
   it('binds an old worker official session to that worker and keeps it fenced', async () => {

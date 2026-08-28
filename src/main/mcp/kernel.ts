@@ -452,13 +452,14 @@ async function dispatchTracked(
     return conversationId;
   };
   if (requestConversation) context.caller.conversationId = acceptRequestConversation(requestConversation);
-  // The page cannot publish metadata.request_id until the complete gateway fanout has a
-  // connector result to render. A waiter inside that fanout therefore blocks the evidence it
-  // is waiting for: live, five immediate replicas and one 30-second waiter all returned
-  // PENDING, and the exact page join appeared only after the waiter had ended. Return every
-  // unbound replica without execution. The rendered page then binds this official session,
-  // and only a later model retry may run. An old dormant worker follows the same path, binds
-  // to its old conversation, and is fenced as WORKER_SLEEPING.
+  // The page cannot publish the call's `wfr_...` request id until the complete gateway fanout
+  // has a connector result to render. A waiter inside that fanout therefore blocks the evidence
+  // it is waiting for. Current ChatGPT can publish a separate UUID-shaped conversation-scope
+  // request before the fanout; openai-caller.ts joins it to the official opaque session by exact
+  // process-local HMAC equality. When that stronger early proof exists, transportConversation is
+  // already set above and this bootstrap is skipped. Otherwise every unbound replica still
+  // returns without execution: a later page join may bind the session, while an old dormant
+  // worker binds to its old conversation and is fenced as WORKER_SLEEPING.
   const bootstrapPhase =
     !callerIdentityConflict &&
     !context.caller.conversationId &&
