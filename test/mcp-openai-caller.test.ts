@@ -150,6 +150,13 @@ describe('OpenAI MCP caller identity', () => {
     release();
     await expect(Promise.all(replicas)).resolves.toEqual(Array.from({ length: 6 }, () => ({ execution: 1 })));
 
+    // The live gateway delivered two more replicas only after the leader had completed.
+    // The same wire request must keep returning the exact cached result in that fanout window.
+    await expect(
+      coalesceOpenAiCallerExecution(identity.key, 'wfr_singleflight', 's:rpc-7', run)
+    ).resolves.toEqual({ execution: 1 });
+    expect(executions).toBe(1);
+
     await coalesceOpenAiCallerExecution(identity.key, 'wfr_singleflight', 's:rpc-8', run);
     expect(executions).toBe(2);
   });

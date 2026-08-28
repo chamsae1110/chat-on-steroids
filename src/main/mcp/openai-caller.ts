@@ -37,7 +37,8 @@ const processKey = randomBytes(32);
 const bindings = new Map<string, string | null>();
 const callerByRequest = new Map<string, string | null>();
 const bootstrap = new Set<string>();
-const executionByWireRequest = new Map<string, Promise<unknown>>();
+const COMPLETED_REPLICA_TTL_MS = 30_000;
+const executionByWireRequest = new Map<string, { promise: Promise<unknown>; expiresAt: number }>();
 
 function poison(key: string): void {
   bindings.set(key, null);
@@ -173,8 +174,10 @@ export function beginOpenAiCallerBootstrap(key: string | null): OpenAiBootstrapP
  * ChatGPT's gateway can fan the same JSON-RPC request over several HTTP requests.
  * The exact caller key, page-join request id and JSON-RPC id together identify that
  * logical request without trusting a model-provided argument or collapsing distinct
- * calls in one assistant turn. Followers receive the leader's exact result; the entry
- * disappears when the leader settles, so a later request cannot replay stale output.
+ * calls in one assistant turn. Followers receive the leader's exact result. ChatGPT can
+ * deliver replicas sequentially (the live Core canary issued three over ~3 seconds), so a
+ * completed result remains available for one short fanout window. A genuinely new logical
+ * tool call has a new JSON-RPC id and is never collapsed into that cached result.
  */
 export function coalesceOpenAiCallerExecution<T>(
   key: string | null,
@@ -184,14 +187,26 @@ export function coalesceOpenAiCallerExecution<T>(
 ): Promise<T> {
   if (!key || !requestId || !wireRequestId) return run();
   const executionKey = `${key}\0${requestId}\0${wireRequestId}`;
-  const existing = executionByWireRequest.get(executionKey) as Promise<T> | undefined;
-  if (existing) return existing;
+  const existing = executionByWireRequest.get(executionKey);
+  if (existing && existing.expiresAt > Date.now()) return existing.promise as Promise<T>;
+  if (existing) executionByWireRequest.delete(executionKey);
   const leader = Promise.resolve().then(run);
-  executionByWireRequest.set(executionKey, leader);
+  const entry = { promise: leader as Promise<unknown>, expiresAt: Number.POSITIVE_INFINITY };
+  executionByWireRequest.set(executionKey, entry);
+  while (executionByWireRequest.size > MAX_REQUEST_BINDINGS) {
+    const oldest = executionByWireRequest.keys().next().value as string | undefined;
+    if (!oldest || oldest === executionKey) break;
+    executionByWireRequest.delete(oldest);
+  }
   void leader.finally(() => {
-    if (executionByWireRequest.get(executionKey) === leader) {
-      executionByWireRequest.delete(executionKey);
-    }
+    if (executionByWireRequest.get(executionKey) !== entry) return;
+    entry.expiresAt = Date.now() + COMPLETED_REPLICA_TTL_MS;
+    const timer = setTimeout(() => {
+      if (executionByWireRequest.get(executionKey) === entry && entry.expiresAt <= Date.now()) {
+        executionByWireRequest.delete(executionKey);
+      }
+    }, COMPLETED_REPLICA_TTL_MS);
+    timer.unref?.();
   }).catch(() => undefined);
   return leader;
 }
