@@ -94,6 +94,17 @@ function prune(): void {
 
 /** The workspace for the call currently running, or null if it has none. */
 export function currentWorkspace(): Workspace | null {
+  const call = currentCall();
+  if (!call?.caller.conversationId && call?.oracleProjectRoot) {
+    return {
+      // On Windows an absolute native base is normalized through the same sandbox path
+      // converter as every model-supplied native path. The grant root itself was sealed
+      // before submission and is rechecked again in resolveIn.
+      virtual: call.oracleProjectRoot,
+      real: call.oracleProjectRoot,
+      at: Date.now()
+    };
+  }
   const key = workspaceKey();
   if (!key) return null;
   prune();
@@ -102,7 +113,6 @@ export function currentWorkspace(): Workspace | null {
   // On its first exact attributed call, atomically migrate that staging value to the durable
   // conversation key. Never do the reverse: a missing chat workspace must not pick up a friendly
   // id from some other prime history after run turnover.
-  const call = currentCall();
   if (!held && key.startsWith('chat:') && call?.agent) {
     const stagedKey = `agent:${call.agent}`;
     const staged = workspaces.get(stagedKey);

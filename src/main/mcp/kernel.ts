@@ -20,6 +20,7 @@
  */
 
 import { rawPromises as fs } from '../rawfs.js';
+import path from 'node:path';
 import { inboundOpenAiHeaders, inboundRequestId } from './inbound.js';
 import { McpServer, type ServerContext } from '@modelcontextprotocol/server';
 import {
@@ -32,6 +33,7 @@ import {
   resolveOpenAiCallerIdentity,
   type OpenAiCallerIdentity
 } from './openai-caller.js';
+import { claimOracleReadGrant, oracleGrantForCaller } from './oracle-caller-grant.js';
 import { z } from 'zod';
 import type { Capabilities, Root } from '../../shared/types.js';
 import { FsOpError, formatBytes, type FileInfo } from '../fsops.js';
@@ -398,6 +400,7 @@ async function dispatch(
     transportKey,
     agent: null,
     caller: { transportKey, requestId, conversationId: null },
+    oracleProjectRoot: null,
     outcome: null,
     evidence: emptyEvidence()
   };
@@ -452,18 +455,41 @@ async function dispatchTracked(
     return conversationId;
   };
   if (requestConversation) context.caller.conversationId = acceptRequestConversation(requestConversation);
+  const input = args && typeof args === 'object' ? (args as Record<string, unknown>) : {};
+  const oracleRunId = typeof input['oracle_run_id'] === 'string' ? input['oracle_run_id'] : null;
+  const oracleToken = typeof input['oracle_token'] === 'string' ? input['oracle_token'] : null;
+  const hasOracleClaim = oracleRunId !== null || oracleToken !== null;
+  let oracleClaimError: string | null = null;
+  if (hasOracleClaim) {
+    if (name !== 'read' || !oracleRunId || !oracleToken || !Array.isArray(input['paths'])) {
+      oracleClaimError = 'ORACLE_CALLER_GRANT_INPUT_INVALID';
+    } else if (callerIdentityConflict) {
+      oracleClaimError = 'ORACLE_CALLER_IDENTITY_CONFLICT';
+    } else {
+      const claimed = await claimOracleReadGrant({
+        callerKey: openAiCaller.key,
+        runId: oracleRunId,
+        token: oracleToken,
+        requestedPaths: input['paths'].filter((value): value is string => typeof value === 'string')
+      });
+      if (!claimed.ok) oracleClaimError = claimed.code;
+    }
+  }
+  const oracleGrant = oracleClaimError ? null : oracleGrantForCaller(openAiCaller.key);
+  const oracleAuthorized = Boolean(oracleGrant && !callerIdentityConflict && !context.caller.conversationId);
+  context.oracleProjectRoot = oracleAuthorized ? oracleGrant!.projectRoot : null;
   // The page cannot publish the call's `wfr_...` request id until the complete gateway fanout
   // has a connector result to render. A waiter inside that fanout therefore blocks the evidence
-  // it is waiting for. Current ChatGPT can publish a separate UUID-shaped conversation-scope
-  // request before the fanout; openai-caller.ts joins it to the official opaque session by exact
-  // process-local HMAC equality. When that stronger early proof exists, transportConversation is
-  // already set above and this bootstrap is skipped. Otherwise every unbound replica still
-  // returns without execution: a later page join may bind the session, while an old dormant
-  // worker binds to its old conversation and is fenced as WORKER_SLEEPING.
+  // it is waiting for, and every ordinary unbound replica returns without execution. The only
+  // pre-page exception is a one-use Oracle Prime grant: the controller hash-binds it to the exact
+  // run, source task, project, mission bytes, Core app, GPT-5.6 Sol and Pro effort before browser
+  // submission. The random token appears only in that new conversation's first read call. Old
+  // dormant workers never receive it and remain on this no-execution path.
   const bootstrapPhase =
     !callerIdentityConflict &&
     !context.caller.conversationId &&
     hasDormantWorkerLeases() &&
+    !oracleAuthorized &&
     openAiCaller.key
       ? beginOpenAiCallerBootstrap(openAiCaller.key)
       : 'resolved';
@@ -476,7 +502,7 @@ async function dispatchTracked(
   // mate while a swarm is active. Use the full exact-id window, not the shorter prime window:
   // the live worker failure that motivated IDENTITY_EVIDENCE_MS arrived ~8 seconds late.
   const identitySensitive = needsWorkspaceIdentity(name, args);
-  if (!callerIdentityPending && !context.caller.conversationId && identitySensitive && swarmRunning() && requestId) {
+  if (!oracleAuthorized && !callerIdentityPending && !context.caller.conversationId && identitySensitive && swarmRunning() && requestId) {
     context.caller.conversationId = acceptRequestConversation(
       await awaitFreshCallOrigin(name, startedAt, IDENTITY_EVIDENCE_MS, { requestId })
     );
@@ -484,7 +510,7 @@ async function dispatchTracked(
   // A run that ended leaves an explicit short-lived lease tombstone for each open worker
   // chat. Resolve exact request identity before ordinary tools too while such leases exist;
   // otherwise an explicit-workdir exec could keep mutating after its worker was retired.
-  if (!callerIdentityPending && !context.caller.conversationId && hasRetiredWorkerLeases() && requestId) {
+  if (!oracleAuthorized && !callerIdentityPending && !context.caller.conversationId && hasRetiredWorkerLeases() && requestId) {
     context.caller.conversationId = acceptRequestConversation(
       await awaitFreshCallOrigin(name, startedAt, IDENTITY_EVIDENCE_MS, { requestId })
     );
@@ -494,7 +520,7 @@ async function dispatchTracked(
   // attribution an absolute read/exec would otherwise look like an unrelated ordinary chat and
   // run successfully. Resolve the exact mate for every call while such worker conversations
   // exist, just as we do for short-lived retired worker leases.
-  if (!callerIdentityPending && !context.caller.conversationId && !callerIdentityConflict && hasDormantWorkerLeases() && requestId) {
+  if (!oracleAuthorized && !callerIdentityPending && !context.caller.conversationId && !callerIdentityConflict && hasDormantWorkerLeases() && requestId) {
     context.caller.conversationId = acceptRequestConversation(
       await awaitFreshCallOrigin(name, startedAt, DORMANT_HISTORY_EVIDENCE_MS, { requestId })
     );
@@ -553,8 +579,15 @@ async function dispatchTracked(
   // inbox that rode on the missing result. Every other tool call from the same chat is refused
   // by endedWorkerNotice as before.
   const endedWorker = isFinish ? null : endedWorkerNotice(context.caller.conversationId);
-  const retiredLeaseAmbiguous = hasRetiredWorkerLeases() && !context.caller.conversationId;
-  const dormantLeaseAmbiguous = hasDormantWorkerLeases() && !context.caller.conversationId;
+  const retiredLeaseAmbiguous = !oracleAuthorized && hasRetiredWorkerLeases() && !context.caller.conversationId;
+  const dormantLeaseAmbiguous = !oracleAuthorized && hasDormantWorkerLeases() && !context.caller.conversationId;
+  const oracleToolAllowed =
+    !oracleAuthorized ||
+    name === 'read' ||
+    name === 'view_image' ||
+    (name === 'find' && typeof input['path'] === 'string') ||
+    name === 'apply_patch' ||
+    name === 'exec_command';
   // In a swarm, a relative/defaulted filesystem operation is not safe to execute after the
   // exact caller lookup timed out: its workspace is part of the requested operation. Falling
   // back to the first approved root turns an attribution outage into wrong-project mutation.
@@ -566,10 +599,20 @@ async function dispatchTracked(
               'CALLER_IDENTITY_CONFLICT: ChatGPT supplied contradictory caller identity evidence. No local tool was run. Reload the conversation and extension before retrying.'
             )
           )
+        : oracleClaimError
+        ? Promise.resolve(
+            fail(`ORACLE_CALLER_GRANT_REJECTED: ${oracleClaimError}. No local tool was run.`)
+          )
         : callerIdentityPending
         ? Promise.resolve(
             fail(
               'CALLER_IDENTITY_PENDING: the connector returned without running a local tool so the browser extension can bind this exact ChatGPT request. Retry the identical call once; ambiguous or dormant-worker ownership will remain blocked.'
+            )
+          )
+        : !oracleToolAllowed
+        ? Promise.resolve(
+            fail(
+              'ORACLE_CALLER_GRANT_SCOPE_REQUIRED: browser conversation evidence has not arrived yet, and this one-use grant permits only project-scoped Core file and command tools. No local tool was run.'
             )
           )
         : dormantWorker
@@ -594,7 +637,7 @@ async function dispatchTracked(
               'CALLER_IDENTITY_REQUIRED: a dormant worker chat still belongs to its prime history, and the connector could not prove this call belongs to a different conversation. No local tool was run. Restore the browser-extension identity path and retry.'
             )
           )
-        : swarmRunning() && identitySensitive && !context.caller.conversationId
+        : !oracleAuthorized && swarmRunning() && identitySensitive && !context.caller.conversationId
         ? Promise.resolve(
             fail(
               'CALLER_IDENTITY_REQUIRED: this operation needs this chat’s exact workspace, but the connector could not prove which ChatGPT conversation made the call. Retry after the extension reconnects; no file or command was changed.'
@@ -646,9 +689,13 @@ async function dispatchTracked(
   // subtly earlier internal value that omits the worker report most likely to matter later.
   const delivered = withInbox(context.caller.conversationId, context.agent, result, isFinish);
   const recorderStartedAt = Date.now();
+  const recordedArgs =
+    args && typeof args === 'object' && Object.prototype.hasOwnProperty.call(args, 'oracle_token')
+      ? Object.fromEntries(Object.entries(args as Record<string, unknown>).filter(([key]) => key !== 'oracle_token'))
+      : args;
   const recording = recordToolCall({
     tool: name,
-    args,
+    args: recordedArgs,
     content: delivered.content,
     outcome: context.outcome ?? (result.isError ? 'rejected' : 'ok'),
     durationMs,
@@ -763,6 +810,13 @@ export async function resolveIn(
     ...(options.allowMissing === undefined ? {} : { allowMissing: options.allowMissing }),
     base
   });
+  const oracleRoot = currentCall()?.oracleProjectRoot;
+  if (oracleRoot) {
+    const relative = path.relative(path.resolve(oracleRoot), path.resolve(resolved.real));
+    if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+      throw new SandboxError('Oracle caller grant is restricted to its exact project root');
+    }
+  }
   // Absolute only: a workspace learned from a relative path would let one loose resolution
   // decide where the next loose resolution points. See workspace.ts.
   if (isAbsoluteVirtualPath(requested) || isNativeWindowsPath(requested)) await learnWorkspace(resolved);

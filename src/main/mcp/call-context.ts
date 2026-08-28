@@ -69,6 +69,12 @@ export interface CallContext {
   /** Who this call was proven to be, for the broker tools to route by. */
   caller: CallCaller;
   /**
+   * Exact project root from a consumed, hash-bound Oracle Prime grant while
+   * browser request evidence is still late. It is never inferred from a tool
+   * argument and disappears once this request ends.
+   */
+  oracleProjectRoot?: string | null;
+  /**
    * Set by the tool guard, which is the only code that can tell a refusal apart from
    * a genuine failure — both come back to the model as an error result.
    */

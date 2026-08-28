@@ -649,8 +649,7 @@ describe('activity feed', () => {
             requestId,
             createTime: Date.now() / 1000
           }
-        ],
-        scopeCandidates: ['opaque-page-candidate', 'opaque-page-candidate']
+        ]
       }
     });
     expect(mapped.status).toBe(200);
@@ -659,7 +658,6 @@ describe('activity feed', () => {
       conversationId,
       requestIds: [requestId],
       confirmed: [requestId],
-      scopeMatched: false,
       complete: true
     });
     expect(mapped.body.sessionId).toBeTruthy();

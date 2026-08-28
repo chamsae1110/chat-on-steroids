@@ -57,7 +57,6 @@ import {
   sessionDurableModifiedAt
 } from './session/store.js';
 import { inFlightMcpRequests, runningToolCalls, settlingToolCalls } from './mcp/call-context.js';
-import { observeOpenAiPageScopeCandidates } from './mcp/openai-caller.js';
 import { nativeHandoffPrompt } from './session/handoff-prompt.js';
 import { briefShortfall, resumeBootstrapText } from './session/handoff.js';
 import {
@@ -960,16 +959,6 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     if (!id) return json(res, 400, { error: 'bad_conversation_id' }, origin);
     const calls = parseCallEvidence(body['calls'], true).filter((call) => call.requestId !== null);
     if (calls.length === 0) return json(res, 400, { error: 'bad_request_evidence' }, origin);
-    const scopeCandidates = Array.isArray(body['scopeCandidates'])
-      ? [...new Set(body['scopeCandidates'].slice(0, 256).filter(
-          (value): value is string =>
-            typeof value === 'string' &&
-            value.length > 0 &&
-            value.length <= 512 &&
-            value.trim() === value &&
-            !/[\u0000-\u001f\u007f]/.test(value)
-        ))]
-      : [];
 
     // This is the live-turn ownership handshake, deliberately separate from transcript
     // delivery. A fresh ChatGPT conversation can expose metadata.request_id before its
@@ -1003,11 +992,6 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     // Even an already-confirmed mapping must ensure/reuse the chat session, matching /events'
     // first-observation semantics and making this one atomic operation from the page's view.
     const result = await recordChatObservations(id, observations, agentForOwnedConversation(id));
-    // Unlike request-id correlations, these provider identity candidates are deliberately
-    // ephemeral. The MCP module immediately HMACs them and retains no raw value. They can
-    // authenticate a caller only by exact equality with official `openai/session`; arbitrary,
-    // stale, mismatched, or contradictory candidates leave execution fail-closed.
-    const scopeMatched = observeOpenAiPageScopeCandidates(scopeCandidates, id);
     const confirmed = requestIds.filter((requestId) => requestCorrelation(requestId)?.conversationId === id);
     return json(res, 200, {
       ok: true,
@@ -1016,7 +1000,6 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       requestIds,
       confirmed,
       conflicts,
-      scopeMatched,
       complete: conflicts.length === 0 && confirmed.length === requestIds.length
     }, origin);
   }

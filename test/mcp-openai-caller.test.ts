@@ -4,12 +4,10 @@ import {
   bindOpenAiCallerForRequest,
   beginOpenAiCallerBootstrap,
   coalesceOpenAiCallerExecution,
-  conflictOpenAiCallerForRequest,
   conversationForOpenAiCaller,
   openAiCallerConflicted,
   openAiHeaderEvidence,
   noteOpenAiCallerRequest,
-  observeOpenAiPageScopeCandidates,
   resetOpenAiCallerBindingsForTests,
   resolveOpenAiCallerIdentity
 } from '../src/main/mcp/openai-caller.js';
@@ -114,92 +112,6 @@ describe('OpenAI MCP caller identity', () => {
     expect(noteOpenAiCallerRequest('wfr_late', two.key)).toBe(false);
     expect(openAiCallerConflicted(one.key)).toBe(true);
     expect(openAiCallerConflicted(two.key)).toBe(true);
-  });
-
-  it('accepts an earlier exact page scope when it equals the official opaque session', () => {
-    const rawSession = 'bbf09ac8-787c-47e5-9693-9b3e88352f23';
-    // The page can publish this conversation-scope request before any MCP call.
-    expect(bindOpenAiCallerForRequest(rawSession, 'conversation-early-scope')).toBe(false);
-
-    const identity = resolveOpenAiCallerIdentity(
-      undefined,
-      openAiHeaderEvidence({
-        'x-openai-session': rawSession,
-        'x-openai-subject': 'subject-early-scope'
-      })
-    );
-    expect(conversationForOpenAiCaller(identity.key)).toBe('conversation-early-scope');
-    expect(beginOpenAiCallerBootstrap(identity.key)).toBe('resolved');
-  });
-
-  it('matches one allowlisted page-model candidate without retaining alternatives', () => {
-    expect(
-      observeOpenAiPageScopeCandidates(
-        ['message-id', 'working-turn-id', 'opaque-official-session', 'parent-id'],
-        'conversation-candidates'
-      )
-    ).toBe(false);
-    const identity = resolveOpenAiCallerIdentity(
-      undefined,
-      openAiHeaderEvidence({
-        'x-openai-session': 'opaque-official-session',
-        'x-openai-subject': 'candidate-subject'
-      })
-    );
-    expect(conversationForOpenAiCaller(identity.key)).toBe('conversation-candidates');
-  });
-
-  it('does not substitute a different page request id for the official opaque session', () => {
-    expect(bindOpenAiCallerForRequest('page-scope-a', 'conversation-a')).toBe(false);
-    const identity = resolveOpenAiCallerIdentity(
-      undefined,
-      openAiHeaderEvidence({
-        'x-openai-session': 'official-scope-b',
-        'x-openai-subject': 'subject-b'
-      })
-    );
-    expect(conversationForOpenAiCaller(identity.key)).toBeNull();
-    expect(beginOpenAiCallerBootstrap(identity.key)).toBe('first');
-  });
-
-  it('poisons an official scope claimed by two page conversations', () => {
-    const rawSession = 'page-scope-conflict';
-    expect(bindOpenAiCallerForRequest(rawSession, 'conversation-a')).toBe(false);
-    const identity = resolveOpenAiCallerIdentity(
-      undefined,
-      openAiHeaderEvidence({
-        'x-openai-session': rawSession,
-        'x-openai-subject': 'subject-conflict'
-      })
-    );
-    expect(conversationForOpenAiCaller(identity.key)).toBe('conversation-a');
-
-    conflictOpenAiCallerForRequest(rawSession);
-    expect(conversationForOpenAiCaller(identity.key)).toBeNull();
-    expect(openAiCallerConflicted(identity.key)).toBe(true);
-  });
-
-  it('fails closed if one opaque scope appears under two official subjects', () => {
-    const rawSession = 'shared-opaque-scope';
-    expect(bindOpenAiCallerForRequest(rawSession, 'conversation-shared')).toBe(false);
-    const first = resolveOpenAiCallerIdentity(
-      undefined,
-      openAiHeaderEvidence({
-        'x-openai-session': rawSession,
-        'x-openai-subject': 'subject-one'
-      })
-    );
-    const second = resolveOpenAiCallerIdentity(
-      undefined,
-      openAiHeaderEvidence({
-        'x-openai-session': rawSession,
-        'x-openai-subject': 'subject-two'
-      })
-    );
-    expect(openAiCallerConflicted(first.key)).toBe(true);
-    expect(openAiCallerConflicted(second.key)).toBe(true);
-    expect(conversationForOpenAiCaller(first.key)).toBeNull();
-    expect(conversationForOpenAiCaller(second.key)).toBeNull();
   });
 
   it('keeps every unbound gateway replica in immediate no-execution bootstrap until page evidence binds it', () => {

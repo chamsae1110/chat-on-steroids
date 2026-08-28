@@ -8,6 +8,7 @@
  */
 
 import http from 'node:http';
+import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -87,6 +88,7 @@ const {
 const { startMcpServer } = await import('../src/main/mcp/server.js');
 const { DORMANT_HISTORY_EVIDENCE_CEILING_MS } = await import('../src/main/mcp/kernel.js');
 const { resetOpenAiCallerBindingsForTests } = await import('../src/main/mcp/openai-caller.js');
+const { resetOracleCallerGrantsForTests } = await import('../src/main/mcp/oracle-caller-grant.js');
 const { runningToolCalls } = await import('../src/main/mcp/call-context.js');
 const { flushDurable, initDurableStore, readDurable, writeDurableNow, writeDurableSoon } = await import('../src/main/durable.js');
 const { findSessionByConversation, initSessionStore, readRecentEvents, resetSessionStoreForTests } = await import(
@@ -122,6 +124,7 @@ beforeEach(() => {
   resetAgentsForTests();
   resetRecorderForTests();
   resetOpenAiCallerBindingsForTests();
+  resetOracleCallerGrantsForTests();
   resetWorkspaces();
   // The real app wires the broker's immediate persistence sink during startup. MCP endpoint
   // tests exercise that production contract rather than an intentionally half-wired broker;
@@ -2193,78 +2196,84 @@ describe('through the MCP endpoint', () => {
     }
   });
 
-  it('uses an early exact page scope for the first six-replica call and executes that logical call once', async () => {
+  it('lets one Oracle-opened official caller consume a hash-bound mission grant while dormant history stays fenced', async () => {
     startSwarm(1);
     const worker = startWorker('worker-1');
-    finishAgent(worker.caller, 'park before the early-scope prime call');
+    finishAgent(worker.caller, 'park before the Oracle Prime grant');
     expect(releaseQuiescentRun()).toBe(true);
 
     await endpoint.stop();
     endpoint = await startMcpServer(() => ({
-      roots: [{ name: 'scope-probe', path: dir }],
-      caps: { ...DEFAULT_CAPABILITIES, command: true },
-      readOnly: false,
-      sessionTools: false,
+      roots: [{ name: 'oracle-grant-project', path: dir }],
+      caps: { ...DEFAULT_CAPABILITIES },
+      readOnly: true,
+      sessionTools: true,
       agentTools: true
     }));
-
-    // This is the exact live ordering from 2026-08-28: ChatGPT publishes one UUID-shaped
-    // conversation-scope request before the six Core HTTP replicas, while the replicas use
-    // a later wfr id that is not visible in the page model until they have all returned.
-    const session = 'bbf09ac8-787c-47e5-9693-9b3e88352f23';
-    const subject = 'openai-subject-early-scope';
-    await recordChatObservations('c-openai-early-scope', [
-      { kind: 'turn_start', time: Date.now(), turnId: 't-openai-early-scope' },
-      {
-        kind: 'tool_evidence',
-        time: Date.now(),
-        turnId: 't-openai-early-scope',
-        calls: [{ messageId: 'm-openai-early-scope', tool: '', order: 0, answered: false, requestId: session }]
-      }
-    ]);
-
-    const counter = path.join(dir, 'early-scope-fanout-counter.txt');
-    await fs.writeFile(counter, '', 'utf8');
-    const shell =
-      process.platform === 'win32'
-        ? `${process.env.SystemRoot ?? 'C:\\Windows'}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`
-        : '/bin/sh';
-    const command =
-      process.platform === 'win32'
-        ? `Add-Content -LiteralPath '${counter.replaceAll("'", "''")}' -Value 'once'; Start-Sleep -Milliseconds 300`
-        : `printf '%s\\n' once >> '${counter.replaceAll("'", "'\\''")}'; sleep 0.3`;
-    const args = { cmd: command, workdir: dir, shell, yield_time_ms: 30_000 };
-    const replicas = await Promise.all(
-      Array.from({ length: 6 }, () =>
-        ordinaryAsOpenAiCaller(
-          'wfr_01a04966174d77928fd46eb499e86c49',
-          session,
-          subject,
-          'exec_command',
-          args,
-          false,
-          'scope-logical-call-1'
+    const runId = '20260829T020304Z-abcdef654321';
+    const token = 'OracleGrant_abcdefghijklmnopqrstuvwxyz_0123456789-ABCDEFG';
+    const session = 'official-oracle-grant-session';
+    const mission = path.join(dir, 'oracle-grant-mission.md');
+    const codexHome = path.join(dir, 'oracle-grant-codex-home');
+    const runDir = path.join(codexHome, 'state', 'chatgpt-oracle', 'projects', 'project-key', 'runs', runId);
+    const sha = (value: string): string => createHash('sha256').update(value).digest('hex');
+    await fs.writeFile(mission, 'ORACLE_GRANT_MISSION_OK\n', 'utf8');
+    await fs.mkdir(runDir, { recursive: true });
+    await fs.writeFile(
+      path.join(runDir, 'caller-identity-grant.json'),
+      `${JSON.stringify({
+        schema: 'codex.chatgpt.oracle-core-caller-grant/v1',
+        run_id: runId,
+        source_thread_id: '01a029cc-d9e3-7e42-8f3b-1a96f48da540',
+        project_root: dir,
+        mission_path: mission,
+        mission_sha256: sha('ORACLE_GRANT_MISSION_OK\n'),
+        app_name: 'Chat On Steroids Core',
+        transport: 'pro-devspace',
+        model: 'gpt-5.6-sol',
+        thinking_time: 'pro',
+        token_sha256: sha(token),
+        created_at_ms: Date.now(),
+        expires_at_ms: Date.now() + 10 * 60_000
+      }, null, 2)}\n`,
+      'utf8'
+    );
+    const priorCodexHome = process.env['CODEX_HOME'];
+    process.env['CODEX_HOME'] = codexHome;
+    try {
+      const args = { paths: [mission], oracle_run_id: runId, oracle_token: token };
+      const replicas = await Promise.all(
+        Array.from({ length: 6 }, () =>
+          ordinaryAsOpenAiCaller(
+            'wfr_oracle_grant_first_read',
+            session,
+            'official-oracle-grant-subject',
+            'read',
+            args,
+            false,
+            'oracle-grant-logical-read'
+          )
         )
-      )
-    );
-    for (const replica of replicas.map(textOfReply)) {
-      expect(replica).not.toContain('CALLER_IDENTITY_PENDING');
-      expect(replica).not.toContain('CALLER_IDENTITY_REQUIRED');
-    }
-    expect((await fs.readFile(counter, 'utf8')).trim().split(/\r?\n/)).toEqual(['once']);
+      );
+      for (const text of replicas.map(textOfReply)) {
+        expect(text).toContain('ORACLE_GRANT_MISSION_OK');
+        expect(text).not.toContain('CALLER_IDENTITY_PENDING');
+      }
+      const receipt = await fs.readFile(path.join(runDir, 'caller-identity-claim.json'), 'utf8');
+      expect(receipt).not.toContain(token);
 
-    // A distinct JSON-RPC id is a distinct logical call even in the same assistant turn.
-    // It must not replay the first result or be collapsed into the first operation.
-    await ordinaryAsOpenAiCaller(
-      'wfr_01a04966174d77928fd46eb499e86c49',
-      session,
-      subject,
-      'exec_command',
-      args,
-      false,
-      'scope-logical-call-2'
-    );
-    expect((await fs.readFile(counter, 'utf8')).trim().split(/\r?\n/)).toEqual(['once', 'once']);
+      const brokerCall = await ordinaryAsOpenAiCaller(
+        'wfr_oracle_grant_agents_blocked',
+        session,
+        'official-oracle-grant-subject',
+        'agents',
+        { action: 'status' }
+      );
+      expect(textOfReply(brokerCall)).toContain('ORACLE_CALLER_GRANT_SCOPE_REQUIRED');
+    } finally {
+      if (priorCodexHome === undefined) delete process.env['CODEX_HOME'];
+      else process.env['CODEX_HOME'] = priorCodexHome;
+    }
   });
 
   it('binds an old worker official session to that worker and keeps it fenced', async () => {

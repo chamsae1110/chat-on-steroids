@@ -247,7 +247,6 @@ interface TurnEvidence {
   endMessageId?: string | null;
   calls: TurnCall[];
   requests?: Array<{ requestId: string; messageId: string | null; createTime: number | null }>;
-  scopeCandidates?: string[];
   messages: Array<{
     messageId: string;
     rawMessageId: string;
@@ -388,8 +387,8 @@ describe('reading a row out of the page', () => {
 
   it('keeps the version it was built for on the reply', async () => {
     const { version, rows } = await scan([row([request('req-1', 'read_file')])]);
-    expect(version).toBe(11);
-    expect(rows[0]!.v).toBe(11);
+    expect(version).toBe(10);
+    expect(rows[0]!.v).toBe(10);
   });
   it('counts only TobisComputer requests in the complete turn, not api_tool metadata calls', async () => {
     const mine1 = request('req-1', 'read_file');
@@ -856,21 +855,15 @@ describe('the calls a turn says it made', () => {
     ]);
   });
 
-  it('keeps request evidence minimal while exporting only ephemeral allowlisted scope candidates', async () => {
+  it('carries nothing but the id, the message it sat on and its stamp', async () => {
     const pending = authored('m-allowlist', 'Working.', { createTime: 1786873650.5 });
     pending.metadata!['request_id'] = 'wfr_allowlist';
-    // Identity-shaped provider fields may cross only as ephemeral scope candidates; they
-    // must never be mixed into the durable request evidence or carry arbitrary metadata.
+    // Everything else on a real message's metadata, none of which may leave the page.
     pending.metadata!['parent_id'] = 'must-not-leak';
     pending.metadata!['turn_exchange_id'] = 'must-not-leak';
-    pending.metadata!['unrelated_secret'] = 'never-cross-worlds';
     const { turns } = await scan([], [{ id: 'turn-allowlist', messages: [pending], rendered: ['Working.'] }]);
 
     expect(Object.keys(turns[0]!.requests![0]!).sort()).toEqual(['createTime', 'messageId', 'requestId']);
-    expect(turns[0]!.scopeCandidates).toEqual(
-      expect.arrayContaining(['m-allowlist', 'wfr_allowlist', 'must-not-leak'])
-    );
-    expect(JSON.stringify(turns[0]!.scopeCandidates)).not.toContain('never-cross-worlds');
   });
 
   it('clears a stale turn stamp when that section has no descriptor in this scan', async () => {

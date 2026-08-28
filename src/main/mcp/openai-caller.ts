@@ -36,114 +36,12 @@ const MAX_REQUEST_BINDINGS = 50_000;
 const processKey = randomBytes(32);
 const bindings = new Map<string, string | null>();
 const callerByRequest = new Map<string, string | null>();
-/** Process-local HMAC joins only; raw provider/page identifiers never enter these maps. */
-const scopeByCaller = new Map<string, string>();
-const callerByScope = new Map<string, string | null>();
-const conversationByScope = new Map<string, string | null>();
 const bootstrap = new Set<string>();
 const executionByWireRequest = new Map<string, Promise<unknown>>();
-
-function trimOldest<K, V>(map: Map<K, V>): void {
-  while (map.size > MAX_REQUEST_BINDINGS) {
-    const oldest = map.keys().next().value as K | undefined;
-    if (oldest === undefined) break;
-    map.delete(oldest);
-  }
-}
-
-function scopeKey(value: string): string {
-  return createHmac('sha256', processKey)
-    .update('openai-page-scope-v1\0')
-    .update(value)
-    .digest('hex');
-}
 
 function poison(key: string): void {
   bindings.set(key, null);
   bootstrap.delete(key);
-}
-
-/**
- * Joins the official opaque per-conversation session to a page request id only
- * when their raw opaque values are exactly equal. The comparison is performed
- * through a process-keyed HMAC; neither side is retained or logged.
- *
- * Current ChatGPT can expose this conversation-scope request id before the
- * first connector call while publishing the call's `wfr_...` id only after the
- * complete gateway fanout has returned. Registering the official side here lets
- * that earlier exact page proof authenticate the very first call without a
- * timeout, active-tab guess, or conversation-id substitution.
- */
-function registerCallerScope(key: string, rawSession: string): void {
-  const joined = scopeKey(rawSession);
-  const priorScope = scopeByCaller.get(key);
-  if (priorScope && priorScope !== joined) {
-    poison(key);
-    return;
-  }
-  scopeByCaller.set(key, joined);
-  trimOldest(scopeByCaller);
-
-  if (!callerByScope.has(joined)) {
-    callerByScope.set(joined, key);
-    trimOldest(callerByScope);
-  } else {
-    const priorCaller = callerByScope.get(joined) ?? null;
-    if (priorCaller !== key) {
-      if (priorCaller) poison(priorCaller);
-      poison(key);
-      callerByScope.set(joined, null);
-      return;
-    }
-  }
-
-  if (!conversationByScope.has(joined)) return;
-  const conversationId = conversationByScope.get(joined) ?? null;
-  if (!conversationId) poison(key);
-  else bindOpenAiCaller(key, conversationId);
-}
-
-function bindPageScope(rawRequestId: string, conversationId: string): boolean {
-  const joined = scopeKey(rawRequestId);
-  if (!conversationByScope.has(joined)) {
-    conversationByScope.set(joined, conversationId);
-    trimOldest(conversationByScope);
-  } else {
-    const held = conversationByScope.get(joined) ?? null;
-    if (held !== conversationId) {
-      conversationByScope.set(joined, null);
-      const caller = callerByScope.get(joined) ?? null;
-      if (caller) poison(caller);
-      return false;
-    }
-  }
-  const caller = callerByScope.get(joined) ?? null;
-  return caller ? bindOpenAiCaller(caller, conversationId) : false;
-}
-
-function conflictPageScope(rawRequestId: string): void {
-  const joined = scopeKey(rawRequestId);
-  conversationByScope.set(joined, null);
-  trimOldest(conversationByScope);
-  const caller = callerByScope.get(joined) ?? null;
-  if (caller) poison(caller);
-}
-
-/**
- * Ephemeral page-model identity candidates from the authenticated extension.
- * Values are immediately reduced to process-keyed HMACs and are never returned,
- * logged, or persisted. A candidate has authority only when it is byte-identical
- * to an official `openai/session` already seen by this process (or seen later).
- */
-export function observeOpenAiPageScopeCandidates(
-  candidates: readonly string[],
-  conversationId: string
-): boolean {
-  let matched = false;
-  for (const candidate of candidates) {
-    if (bindPageScope(candidate, conversationId)) matched = true;
-  }
-  return matched;
 }
 
 function opaque(value: unknown, present: boolean): OpaqueField {
@@ -217,7 +115,6 @@ export function resolveOpenAiCallerIdentity(
     .update('\0')
     .update(session.value)
     .digest('hex');
-  registerCallerScope(key, session.value);
   return { key, conflicted: false };
 }
 
@@ -322,16 +219,10 @@ export function noteOpenAiCallerRequest(requestId: string | null, key: string | 
   return false;
 }
 
-/**
- * Page evidence authenticates either the exact MCP request id or the official
- * conversation-scope id exposed before that request. Both joins are exact and
- * contradictions poison the official caller.
- */
+/** Late page evidence can authenticate a caller even after its HTTP result ended. */
 export function bindOpenAiCallerForRequest(requestId: string, conversationId: string): boolean {
   const key = callerByRequest.get(requestId) ?? null;
-  const exact = key ? bindOpenAiCaller(key, conversationId) : false;
-  const scoped = bindPageScope(requestId, conversationId);
-  return exact || scoped;
+  return key ? bindOpenAiCaller(key, conversationId) : false;
 }
 
 /** A request id claimed by two page conversations poisons its transport caller too. */
@@ -339,16 +230,12 @@ export function conflictOpenAiCallerForRequest(requestId: string): void {
   const key = callerByRequest.get(requestId) ?? null;
   if (key) poison(key);
   if (callerByRequest.has(requestId)) callerByRequest.set(requestId, null);
-  conflictPageScope(requestId);
 }
 
 /** Tests only: process restart naturally clears this registry. */
 export function resetOpenAiCallerBindingsForTests(): void {
   bindings.clear();
   callerByRequest.clear();
-  scopeByCaller.clear();
-  callerByScope.clear();
-  conversationByScope.clear();
   bootstrap.clear();
   executionByWireRequest.clear();
 }
