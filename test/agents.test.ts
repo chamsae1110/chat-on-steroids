@@ -84,6 +84,7 @@ const {
   workerRevivalClaimed
 } = await import('../src/main/agents.js');
 const { startMcpServer } = await import('../src/main/mcp/server.js');
+const { DORMANT_HISTORY_EVIDENCE_CEILING_MS } = await import('../src/main/mcp/kernel.js');
 const { runningToolCalls } = await import('../src/main/mcp/call-context.js');
 const { flushDurable, initDurableStore, readDurable, writeDurableNow, writeDurableSoon } = await import('../src/main/durable.js');
 const { findSessionByConversation, initSessionStore, readRecentEvents, resetSessionStoreForTests } = await import(
@@ -2056,6 +2057,33 @@ describe('through the MCP endpoint', () => {
       }
     ]);
     expect(textOfReply(await pending)).toContain('WORKER_SLEEPING');
+  });
+
+  it('keeps a fresh prime call pending for the dormant-history evidence window', async () => {
+    expect(DORMANT_HISTORY_EVIDENCE_CEILING_MS).toBe(50_000);
+    startSwarm(1);
+    const worker = startWorker('worker-1');
+    finishAgent(worker.caller, 'park before a different prime calls');
+    expect(releaseQuiescentRun()).toBe(true);
+
+    const requestId = 'wfr_fresh_prime_after_dormant_history';
+    const pending = ordinaryWithRequestId(requestId, 'read', { paths: ['/anything'] });
+    // This lands after the ordinary 1.5s test window but inside the dedicated 2.5s dormant
+    // history window. The production analogue is exact browser evidence arriving tens of
+    // seconds after the first connector call began.
+    await new Promise((resolve) => setTimeout(resolve, 1_700));
+    await recordChatObservations('c-fresh-prime', [
+      { kind: 'turn_start', time: Date.now(), turnId: 't-fresh-prime-late' },
+      {
+        kind: 'tool_evidence',
+        time: Date.now(),
+        turnId: 't-fresh-prime-late',
+        calls: [{ messageId: 'm-fresh-prime-late', tool: 'read', order: 0, answered: false, requestId }]
+      }
+    ]);
+    const text = textOfReply(await pending);
+    expect(text).not.toContain('CALLER_IDENTITY_REQUIRED');
+    expect(text).toMatch(/unknown root|not found/i);
   });
 
   it('delivers and acknowledges a parked prime inbox by exact conversation without adopting another history', async () => {

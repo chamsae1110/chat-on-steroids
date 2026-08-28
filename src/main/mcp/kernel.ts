@@ -426,7 +426,9 @@ async function dispatchTracked(
   // run successfully. Resolve the exact mate for every call while such worker conversations
   // exist, just as we do for short-lived retired worker leases.
   if (!context.caller.conversationId && hasDormantWorkerLeases() && requestId) {
-    context.caller.conversationId = await awaitFreshCallOrigin(name, startedAt, IDENTITY_EVIDENCE_MS, { requestId });
+    context.caller.conversationId = await awaitFreshCallOrigin(name, startedAt, DORMANT_HISTORY_EVIDENCE_MS, {
+      requestId
+    });
   }
   // Two things about liveness, both before the agent is resolved so that the answer this
   // call gets is the state this call itself established.
@@ -876,6 +878,22 @@ export const PRIME_EVIDENCE_MS = evidenceWindow(2_500);
  * seconds are only ever spent by a call that was going to be refused anyway.
  */
 export const IDENTITY_EVIDENCE_MS = evidenceWindow(15_000);
+
+/**
+ * Exact request-id evidence while a parked worker history still fences ordinary calls.
+ *
+ * This is deliberately longer than the ordinary identity window. A fresh prime conversation
+ * may expose its exact `metadata.request_id` only after ChatGPT has held the first connector
+ * call for tens of seconds; a measured end-to-end call took 44 seconds. Refusing at the
+ * ordinary 15-second ceiling leaves both safe facts unused: the app has not guessed an owner,
+ * and the browser later proves the exact new conversation. Waiting remains fail-closed and
+ * event-driven, and an exact dormant-worker call still resolves to that worker and is fenced.
+ */
+export const DORMANT_HISTORY_EVIDENCE_CEILING_MS = 50_000;
+export const DORMANT_HISTORY_EVIDENCE_MS = evidenceWindow(
+  DORMANT_HISTORY_EVIDENCE_CEILING_MS,
+  process.env.CLF_DORMANT_HISTORY_EVIDENCE_MS ?? process.env.CLF_EVIDENCE_MS
+);
 
 /**
  * The same window again for the two `agents` actions whose refusal cannot be retried cheaply.

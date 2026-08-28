@@ -600,8 +600,7 @@ export function liveConversations(): Array<{
  * Never set outside the test runner, so production keeps the measured windows. The value is
  * also clamped to the production one, so this can only ever make a wait shorter.
  */
-export function evidenceWindow(production: number): number {
-  const raw = process.env.CLF_EVIDENCE_MS;
+export function evidenceWindow(production: number, raw = process.env.CLF_EVIDENCE_MS): number {
   if (raw === undefined) return production;
   const parsed = Number.parseInt(raw, 10);
   return Number.isSafeInteger(parsed) && parsed >= 0 ? Math.min(parsed, production) : production;

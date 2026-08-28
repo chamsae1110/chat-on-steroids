@@ -16,7 +16,10 @@ export default defineConfig({
       // In-process evidence arrives in microseconds or never; the production windows only
       // exist for a real browser that is seconds late. Without this the suite spent minutes
       // waiting out fifteen-second timeouts to prove calls stay unattributed.
-      CLF_EVIDENCE_MS: '1500'
+      CLF_EVIDENCE_MS: '1500',
+      // Keep one deterministic gap between the ordinary and dormant-history windows so the
+      // late fresh-prime regression proves it is exercising the dedicated production path.
+      CLF_DORMANT_HISTORY_EVIDENCE_MS: '2500'
     }
   }
 });
