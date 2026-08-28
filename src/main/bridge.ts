@@ -445,7 +445,9 @@ export async function unpair(): Promise<void> {
   // secrets store looks like, and those are intentionally allowed to provision silently.
   // This impossible-as-a-token sentinel preserves the user's explicit intent across both
   // the extension's next poll and an app restart.
-  await setSecret('bridgeToken', BROWSER_DISCONNECTED);
+  await mutateBridgeCredential(async () => {
+    await setSecret('bridgeToken', BROWSER_DISCONNECTED);
+  });
   logInfo('bridge: browser disconnected');
   changed();
 }
@@ -806,6 +808,45 @@ function goalEnabledFor(id: string): boolean {
 }
 
 /**
+ * One installed app can be observed by more than one Chrome profile.
+ *
+ * Oracle's prime conversation runs in its loopback-controlled profile while reusable worker
+ * chats open in the user's standard Chrome profile. Both copies of the same packaged extension
+ * therefore provision against this bridge. Rotating the only bearer on every `/pair` made the
+ * profiles revoke each other: whichever profile lost the race could still start recording, but
+ * its next request-id correlation was rejected and identity-sensitive tools failed closed.
+ *
+ * `/pair` is already the authority boundary that hands a usable bearer to an allowed extension
+ * origin without an old bearer. Reusing the current non-revoked value grants no new capability;
+ * it merely keeps every profile of this installation on the same credential. A deliberate
+ * Disconnect stores `BROWSER_DISCONNECTED`, and the explicit reconnect below still replaces
+ * that tombstone with a fresh random value, invalidating every pre-disconnect copy.
+ *
+ * Coalesce simultaneous first-use/reconnect requests so two profiles cannot each mint a
+ * different value before either secure-storage write becomes visible.
+ */
+let bridgeCredentialMutation: Promise<void> = Promise.resolve();
+
+function mutateBridgeCredential<T>(mutation: () => Promise<T>): Promise<T> {
+  const pending = bridgeCredentialMutation.then(mutation, mutation);
+  bridgeCredentialMutation = pending.then(
+    () => undefined,
+    () => undefined
+  );
+  return pending;
+}
+
+async function provisionBridgeToken(): Promise<string> {
+  return mutateBridgeCredential(async () => {
+    const current = await getSecret('bridgeToken');
+    if (current && current !== BROWSER_DISCONNECTED) return current;
+    const token = randomBytes(32).toString('base64url');
+    await setSecret('bridgeToken', token);
+    return token;
+  });
+}
+
+/**
  * May the loop act in this chat at all — by the switch, or by this chat's own goal?
  *
  * The switch is the standing rule for every chat: keep going whenever ChatGPT itself says
@@ -921,8 +962,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     // "open a fresh chat" command. It can still not read a file, run anything, or change
     // a permission — the bridge has no route that does. A web page cannot: originOf
     // refuses anything that is not a chrome-extension:// origin, above.
-    const token = randomBytes(32).toString('base64url');
-    await setSecret('bridgeToken', token);
+    const token = await provisionBridgeToken();
     noteBrowserSeen();
     logInfo('bridge: browser extension connected and provisioned');
     changed();

@@ -2058,6 +2058,33 @@ describe('through the MCP endpoint', () => {
     expect(textOfReply(await pending)).toContain('WORKER_SLEEPING');
   });
 
+  it('lets an exactly proven fresh prime use an ordinary Core tool while another history stays dormant', async () => {
+    startSwarm(1);
+    const worker = startWorker('worker-1');
+    finishAgent(worker.caller, 'park this worker history');
+    expect(releaseQuiescentRun()).toBe(true);
+
+    const requestId = 'wfr_fresh_prime_beside_dormant_history';
+    await recordChatObservations('c-fresh-prime', [
+      { kind: 'turn_start', time: Date.now(), turnId: 't-fresh-prime' },
+      {
+        kind: 'tool_evidence',
+        time: Date.now(),
+        turnId: 't-fresh-prime',
+        calls: [{ messageId: 'm-fresh-prime', tool: 'read', order: 0, answered: false, requestId }]
+      }
+    ]);
+
+    const text = textOfReply(await ordinaryWithRequestId(requestId, 'read', { paths: ['/anything'] }));
+    // The empty test root makes the read itself fail in the sandbox. Reaching that normal
+    // operation-specific refusal proves the dormant identity fence did not mistake this exact
+    // fresh conversation for its worker; the historical worker remains fenced below.
+    expect(text).toMatch(/unknown root|not found|outside/i);
+    expect(text).not.toContain('CALLER_IDENTITY_REQUIRED');
+    expect(text).not.toContain('WORKER_SLEEPING');
+    expect(dormantWorkerNotice('c-worker-1')).toContain('WORKER_SLEEPING');
+  });
+
   it('delivers and acknowledges a parked prime inbox by exact conversation without adopting another history', async () => {
     startSwarm(1);
     startWorker('worker-1');

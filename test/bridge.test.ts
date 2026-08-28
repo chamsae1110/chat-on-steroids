@@ -400,12 +400,28 @@ describe('provisioning', () => {
     expect((await request('GET', '/hello', { auth: null })).body.paired).toBe(false);
   });
 
-  it('replaces the token on a second request, so a re-provision supersedes the old one', async () => {
+  it('keeps two browser profiles authorised when both provision the same installed extension', async () => {
     const first = await pair();
     const second = await pair();
-    expect(second).not.toBe(first);
-    expect((await request('GET', '/status', { auth: first })).status).toBe(401);
+    // Oracle drives a dedicated controller profile while reusable workers open in the
+    // standard Chrome profile. Both extensions belong to this same installation. A second
+    // profile asking for the already-live credential must not revoke the first profile just
+    // before its exact request-id correlation is delivered.
+    expect(second).toBe(first);
+    expect((await request('GET', '/status', { auth: first })).status).toBe(200);
     expect((await request('GET', '/status', { auth: second })).status).toBe(200);
+  });
+
+  it('coalesces simultaneous first-use pairing from the controller and worker profiles', async () => {
+    const [controller, worker] = await Promise.all([
+      request('POST', '/pair', { auth: null }),
+      request('POST', '/pair', { auth: null })
+    ]);
+    expect(controller.status).toBe(200);
+    expect(worker.status).toBe(200);
+    expect(controller.body.token).toBe(worker.body.token);
+    expect((await request('GET', '/status', { auth: controller.body.token as string })).status).toBe(200);
+    expect((await request('GET', '/status', { auth: worker.body.token as string })).status).toBe(200);
   });
 
   it('drops the token when the user disconnects the browser', async () => {
@@ -416,7 +432,7 @@ describe('provisioning', () => {
   });
 
   it('keeps an app-side disconnect latched until the browser explicitly reconnects', async () => {
-    await pair();
+    const beforeDisconnect = await pair();
     await unpair();
     // Drop the decrypted in-process cache. The next bridge read now has to recover the
     // disconnect marker from the encrypted file, the relevant half of an app restart.
@@ -437,6 +453,8 @@ describe('provisioning', () => {
     const reconnect = await request('POST', '/pair', { auth: null, body: { reconnect: true } });
     expect(reconnect.status).toBe(200);
     token = reconnect.body.token as string;
+    expect(token).not.toBe(beforeDisconnect);
+    expect((await request('GET', '/status', { auth: beforeDisconnect })).status).toBe(401);
     expect((await request('GET', '/status')).status).toBe(200);
     expect((await request('GET', '/hello', { auth: null })).body).toMatchObject({
       paired: true,
