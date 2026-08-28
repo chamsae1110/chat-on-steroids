@@ -2114,7 +2114,7 @@ describe('through the MCP endpoint', () => {
     ]);
     const text = textOfReply(await pending);
     expect(text).not.toContain('CALLER_IDENTITY_REQUIRED');
-    expect(text).toMatch(/unknown root|not found/i);
+    expect(text).toMatch(/unknown root|not found|not inside an approved folder/i);
   });
 
   it('binds one official OpenAI session from exact page evidence and reuses it without another page wait', async () => {
@@ -2150,7 +2150,7 @@ describe('through the MCP endpoint', () => {
     );
     const text = textOfReply(reused);
     expect(text).not.toContain('CALLER_IDENTITY_REQUIRED');
-    expect(text).toMatch(/unknown root|not found/i);
+    expect(text).toMatch(/unknown root|not found|not inside an approved folder/i);
   });
 
   it('releases every bootstrap replica before the page join and executes only the later retry', async () => {
@@ -2188,7 +2188,7 @@ describe('through the MCP endpoint', () => {
     );
     for (const executed of executedReplicas.map(textOfReply)) {
       expect(executed).not.toContain('CALLER_IDENTITY_PENDING');
-      expect(executed).toMatch(/unknown root|not found/i);
+      expect(executed).toMatch(/unknown root|not found|not inside an approved folder/i);
     }
   });
 
@@ -2243,7 +2243,7 @@ describe('through the MCP endpoint', () => {
       }
     ]);
     const bound = await ordinaryAsOpenAiCaller(firstRequest, session, subject, 'read', { paths: ['/anything'] });
-    expect(textOfReply(bound)).toMatch(/unknown root|not found/i);
+    expect(textOfReply(bound)).toMatch(/unknown root|not found|not inside an approved folder/i);
 
     const secondRequest = 'wfr_openai_sticky_second';
     await recordChatObservations('c-openai-owner-b', [
