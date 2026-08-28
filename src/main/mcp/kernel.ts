@@ -654,7 +654,9 @@ async function dispatchTracked(
               'CALLER_IDENTITY_REQUIRED: this operation needs this chat’s exact workspace, but the connector could not prove which ChatGPT conversation made the call. Retry after the extension reconnects; no file or command was changed.'
             )
           )
-        : coalesceOpenAiCallerExecution(openAiCaller.key, requestId, wireRequestId, run)
+        : coalesceOpenAiCallerExecution(openAiCaller.key, requestId, wireRequestId, run, () => {
+            context.evidence.detail = 'gateway-replica-cache';
+          })
   );
   // Identity, once, from this call's own evidence — see callerConversation. `agents` has
   // already established its own inside the call and adopted it, and re-reading here would

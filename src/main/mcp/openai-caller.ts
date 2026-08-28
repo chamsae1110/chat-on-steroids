@@ -183,12 +183,16 @@ export function coalesceOpenAiCallerExecution<T>(
   key: string | null,
   requestId: string | null,
   wireRequestId: string | null,
-  run: () => Promise<T>
+  run: () => Promise<T>,
+  onReplica?: () => void
 ): Promise<T> {
   if (!key || !requestId || !wireRequestId) return run();
   const executionKey = `${key}\0${requestId}\0${wireRequestId}`;
   const existing = executionByWireRequest.get(executionKey);
-  if (existing && existing.expiresAt > Date.now()) return existing.promise as Promise<T>;
+  if (existing && existing.expiresAt > Date.now()) {
+    onReplica?.();
+    return existing.promise as Promise<T>;
+  }
   if (existing) executionByWireRequest.delete(executionKey);
   const leader = Promise.resolve().then(run);
   const entry = { promise: leader as Promise<unknown>, expiresAt: Number.POSITIVE_INFINITY };
