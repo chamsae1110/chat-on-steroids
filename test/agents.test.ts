@@ -2079,7 +2079,7 @@ describe('through the MCP endpoint', () => {
     // The empty test root makes the read itself fail in the sandbox. Reaching that normal
     // operation-specific refusal proves the dormant identity fence did not mistake this exact
     // fresh conversation for its worker; the historical worker remains fenced below.
-    expect(text).toMatch(/unknown root|not found|outside/i);
+    expect(text).toMatch(/unknown root|not found|outside|not inside an approved/i);
     expect(text).not.toContain('CALLER_IDENTITY_REQUIRED');
     expect(text).not.toContain('WORKER_SLEEPING');
     expect(dormantWorkerNotice('c-worker-1')).toContain('WORKER_SLEEPING');
