@@ -17,6 +17,10 @@
 
 import { readDurable, writeDurableSoon } from '../durable.js';
 import { listAllSessions, readRecentEvents } from './store.js';
+import {
+  bindOpenAiCallerForRequest,
+  conflictOpenAiCallerForRequest
+} from '../mcp/openai-caller.js';
 
 export interface RequestCorrelation {
   requestId: string;
@@ -261,6 +265,8 @@ export function observeRequestCorrelations(
   const results = inputs.map((input) => {
     const previousObservedAt = byRequest.get(input.requestId)?.value?.observedAt;
     const result = merge(input);
+    if (result === 'conflict') conflictOpenAiCallerForRequest(input.requestId);
+    else bindOpenAiCallerForRequest(input.requestId, input.conversationId);
     // A same-owner observation can still advance durable freshness/order. Persist that too so
     // an app restart cannot resurrect the pre-refresh eviction order.
     if (result !== 'same' || (previousObservedAt !== undefined && input.observedAt > previousObservedAt)) changed = true;

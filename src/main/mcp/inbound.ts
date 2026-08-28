@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { openAiHeaderEvidence, type OpenAiHeaderEvidence } from './openai-caller.js';
 
 /**
  * The id ChatGPT puts on the HTTP request that carries a tool call.
@@ -14,16 +15,31 @@ import { AsyncLocalStorage } from 'node:async_hooks';
  * plainly there on the socket. So the surface's request handler runs inside this store and
  * the tool dispatch reads it back.
  */
-const store = new AsyncLocalStorage<string | null>();
+interface InboundIdentity {
+  requestId: string | null;
+  openAi: OpenAiHeaderEvidence;
+}
+
+const EMPTY_OPENAI = openAiHeaderEvidence({});
+const store = new AsyncLocalStorage<InboundIdentity>();
 
 /** Runs `body` with the request id of the HTTP request currently being served. */
+export function withInboundRequestIdentity<T>(identity: InboundIdentity, body: () => T): T {
+  return store.run(identity, body);
+}
+
+/** Compatibility/test helper for callers that carry only the historical request id. */
 export function withInboundRequestId<T>(requestId: string | null, body: () => T): T {
-  return store.run(requestId, body);
+  return withInboundRequestIdentity({ requestId, openAi: EMPTY_OPENAI }, body);
 }
 
 /** The request id of the HTTP request this call is being served on, if it had one. */
 export function inboundRequestId(): string | null {
-  return store.getStore() ?? null;
+  return store.getStore()?.requestId ?? null;
+}
+
+export function inboundOpenAiHeaders(): OpenAiHeaderEvidence {
+  return store.getStore()?.openAi ?? EMPTY_OPENAI;
 }
 
 /**

@@ -18,7 +18,8 @@
  */
 
 import { randomBytes, timingSafeEqual } from 'node:crypto';
-import { requestIdFromHeader, withInboundRequestId } from './inbound.js';
+import { requestIdFromHeader, withInboundRequestIdentity } from './inbound.js';
+import { openAiHeaderEvidence } from './openai-caller.js';
 import http from 'node:http';
 import { createMcpHandler } from '@modelcontextprotocol/server';
 import { localhostHostValidation, localhostOriginValidation, toNodeHandler } from '@modelcontextprotocol/node';
@@ -409,11 +410,15 @@ export async function startMcpServer(getContext: () => ToolContext): Promise<Mcp
           jsonError(res, 400, 'invalid_json');
           return;
         }
-        withInboundRequestId(requestId, () => void route.handler(req, res, parsed.body));
+        withInboundRequestIdentity({ requestId, openAi: openAiHeaderEvidence(req.headers) }, () =>
+          void route.handler(req, res, parsed.body)
+        );
       });
       return;
     }
-    withInboundRequestId(requestId, () => void route.handler(req, res));
+    withInboundRequestIdentity({ requestId, openAi: openAiHeaderEvidence(req.headers) }, () =>
+      void route.handler(req, res)
+    );
   });
 
   // Reject slow or oversized bodies rather than holding sockets open indefinitely.

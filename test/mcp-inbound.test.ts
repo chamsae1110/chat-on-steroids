@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { inboundRequestId, requestIdFromHeader, withInboundRequestId } from '../src/main/mcp/inbound.js';
+import {
+  inboundOpenAiHeaders,
+  inboundRequestId,
+  requestIdFromHeader,
+  withInboundRequestId,
+  withInboundRequestIdentity
+} from '../src/main/mcp/inbound.js';
+import { openAiHeaderEvidence } from '../src/main/mcp/openai-caller.js';
 
 describe('MCP inbound request id boundary', () => {
   it('normalizes the raw x-request-id to the page join key once at ingress', () => {
@@ -30,5 +37,30 @@ describe('MCP inbound request id boundary', () => {
 
     expect(seen).toEqual(['wfr_a', 'wfr_b']);
     expect(inboundRequestId()).toBeNull();
+  });
+
+  it('keeps OpenAI caller headers isolated beside the request id', async () => {
+    const seen = await Promise.all(
+      ['a', 'b'].map((suffix) =>
+        withInboundRequestIdentity(
+          {
+            requestId: `wfr_${suffix}`,
+            openAi: openAiHeaderEvidence({
+              'x-openai-session': `session-${suffix}`,
+              'x-openai-subject': `subject-${suffix}`
+            })
+          },
+          async () => {
+            await Promise.resolve();
+            return [inboundRequestId(), inboundOpenAiHeaders().session.value];
+          }
+        )
+      )
+    );
+    expect(seen).toEqual([
+      ['wfr_a', 'session-a'],
+      ['wfr_b', 'session-b']
+    ]);
+    expect(inboundOpenAiHeaders().session.value).toBeNull();
   });
 });

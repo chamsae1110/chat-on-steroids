@@ -20,8 +20,18 @@
  */
 
 import { rawPromises as fs } from '../rawfs.js';
-import { inboundRequestId } from './inbound.js';
+import { inboundOpenAiHeaders, inboundRequestId } from './inbound.js';
 import { McpServer, type ServerContext } from '@modelcontextprotocol/server';
+import {
+  bindOpenAiCaller,
+  awaitOpenAiCallerConversation,
+  beginOpenAiCallerBootstrap,
+  conversationForOpenAiCaller,
+  noteOpenAiCallerRequest,
+  openAiCallerConflicted,
+  resolveOpenAiCallerIdentity,
+  type OpenAiCallerIdentity
+} from './openai-caller.js';
 import { z } from 'zod';
 import type { Capabilities, Root } from '../../shared/types.js';
 import { FsOpError, formatBytes, type FileInfo } from '../fsops.js';
@@ -255,8 +265,8 @@ function callerConversation(tool: string, startedAt: number, requestId: string |
   return freshCallOrigin(tool, startedAt, requestId);
 }
 
-/** The only SDK handler context field this layer consumes; request identity comes from ingress ALS. */
-type McpCallContext = Pick<ServerContext, 'sessionId'>;
+/** Transport context consumed without adding any model-controlled identity argument. */
+type McpCallContext = Pick<ServerContext, 'sessionId' | 'mcpReq'>;
 
 /**
  * ChatGPT's id for this request, from `x-request-id`, without the per-attempt suffix.
@@ -277,6 +287,11 @@ function requestIdOf(mcpCtx: McpCallContext | undefined): string | null {
   // of truth for the correlation key.
   void mcpCtx;
   return inboundRequestId();
+}
+
+function openAiCallerOf(mcpCtx: McpCallContext | undefined): OpenAiCallerIdentity {
+  const requestMeta = mcpCtx?.mcpReq?._meta as Record<string, unknown> | undefined;
+  return resolveOpenAiCallerIdentity(requestMeta, inboundOpenAiHeaders());
 }
 
 /**
@@ -360,6 +375,7 @@ async function dispatch(
   args: unknown,
   transportKey: string | null,
   requestId: string | null,
+  openAiCaller: OpenAiCallerIdentity,
   surface: SurfaceId,
   run: () => Promise<ToolResult>
 ): Promise<ToolResult> {
@@ -378,7 +394,9 @@ async function dispatch(
     evidence: emptyEvidence()
   };
   return trackMcpRequest(() =>
-    trackInFlight(context, () => dispatchTracked(context, name, args, transportKey, requestId, surface, run))
+    trackInFlight(context, () =>
+      dispatchTracked(context, name, args, transportKey, requestId, openAiCaller, surface, run)
+    )
   );
 }
 
@@ -388,6 +406,7 @@ async function dispatchTracked(
   args: unknown,
   transportKey: string | null,
   requestId: string | null,
+  openAiCaller: OpenAiCallerIdentity,
   surface: SurfaceId,
   run: () => Promise<ToolResult>
 ): Promise<ToolResult> {
@@ -402,7 +421,51 @@ async function dispatchTracked(
   // request id, identity-sensitive handlers (workspace/session/agents) see it before they
   // touch state. If the page is one tick late this stays null; only handlers that actually
   // require identity wait for their own exact mate. Ordinary absolute reads/execs never wait.
-  context.caller.conversationId = callerConversation(name, startedAt, requestId);
+  const requestIdentityConsistent = noteOpenAiCallerRequest(requestId, openAiCaller.key);
+  let callerIdentityConflict =
+    openAiCaller.conflicted || !requestIdentityConsistent || openAiCallerConflicted(openAiCaller.key);
+  const requestConversation = callerConversation(name, startedAt, requestId);
+  const transportConversation = conversationForOpenAiCaller(openAiCaller.key);
+  if (requestConversation && transportConversation && requestConversation !== transportConversation) {
+    bindOpenAiCaller(openAiCaller.key, requestConversation);
+    callerIdentityConflict = true;
+  }
+  context.caller.conversationId = callerIdentityConflict
+    ? null
+    : transportConversation ?? requestConversation;
+
+  const acceptRequestConversation = (conversationId: string | null): string | null => {
+    if (!conversationId || callerIdentityConflict) return null;
+    if (openAiCaller.key && !bindOpenAiCaller(openAiCaller.key, conversationId)) {
+      callerIdentityConflict = true;
+      return null;
+    }
+    return conversationId;
+  };
+  if (requestConversation) context.caller.conversationId = acceptRequestConversation(requestConversation);
+  // The page cannot publish metadata.request_id until it has a connector result to render.
+  // Waiting here deadlocks that evidence behind the HTTP response and eventually turns a
+  // fail-closed local refusal into ChatGPT's opaque 502. A valid official OpenAI session lets
+  // us make the bootstrap deterministic without trusting it yet: return one no-execution
+  // result immediately, let the extension join this exact request id to its page, and accept
+  // only a later call after that join has bound the session. An old dormant worker follows the
+  // same path, binds to its old conversation, and is then fenced as WORKER_SLEEPING.
+  const bootstrapPhase =
+    !callerIdentityConflict &&
+    !context.caller.conversationId &&
+    hasDormantWorkerLeases() &&
+    openAiCaller.key
+      ? beginOpenAiCallerBootstrap(openAiCaller.key)
+      : 'resolved';
+  if (bootstrapPhase === 'waiter') {
+    context.caller.conversationId = await awaitOpenAiCallerConversation(
+      openAiCaller.key,
+      OPENAI_BOOTSTRAP_EVIDENCE_MS
+    );
+  }
+  const callerIdentityPending =
+    bootstrapPhase === 'first' || bootstrapPhase === 'duplicate' ||
+    (bootstrapPhase === 'waiter' && !context.caller.conversationId);
   // Only calls that need an *existing* per-chat workspace before the handler runs are
   // identity-sensitive here. An absolute read or an exec with an explicit absolute workdir is
   // self-contained and must stay fast; if its exact page mate is late, workspace.ts simply
@@ -411,24 +474,28 @@ async function dispatchTracked(
   // mate while a swarm is active. Use the full exact-id window, not the shorter prime window:
   // the live worker failure that motivated IDENTITY_EVIDENCE_MS arrived ~8 seconds late.
   const identitySensitive = needsWorkspaceIdentity(name, args);
-  if (!context.caller.conversationId && identitySensitive && swarmRunning() && requestId) {
-    context.caller.conversationId = await awaitFreshCallOrigin(name, startedAt, IDENTITY_EVIDENCE_MS, { requestId });
+  if (!callerIdentityPending && !context.caller.conversationId && identitySensitive && swarmRunning() && requestId) {
+    context.caller.conversationId = acceptRequestConversation(
+      await awaitFreshCallOrigin(name, startedAt, IDENTITY_EVIDENCE_MS, { requestId })
+    );
   }
   // A run that ended leaves an explicit short-lived lease tombstone for each open worker
   // chat. Resolve exact request identity before ordinary tools too while such leases exist;
   // otherwise an explicit-workdir exec could keep mutating after its worker was retired.
-  if (!context.caller.conversationId && hasRetiredWorkerLeases() && requestId) {
-    context.caller.conversationId = await awaitFreshCallOrigin(name, startedAt, IDENTITY_EVIDENCE_MS, { requestId });
+  if (!callerIdentityPending && !context.caller.conversationId && hasRetiredWorkerLeases() && requestId) {
+    context.caller.conversationId = acceptRequestConversation(
+      await awaitFreshCallOrigin(name, startedAt, IDENTITY_EVIDENCE_MS, { requestId })
+    );
   }
   // Dormant histories are long-lived identity fences, not active slot claims. An old worker tab
   // may still issue a stale server-side call after its run parked, and without exact request-id
   // attribution an absolute read/exec would otherwise look like an unrelated ordinary chat and
   // run successfully. Resolve the exact mate for every call while such worker conversations
   // exist, just as we do for short-lived retired worker leases.
-  if (!context.caller.conversationId && hasDormantWorkerLeases() && requestId) {
-    context.caller.conversationId = await awaitFreshCallOrigin(name, startedAt, DORMANT_HISTORY_EVIDENCE_MS, {
-      requestId
-    });
+  if (!callerIdentityPending && !context.caller.conversationId && !callerIdentityConflict && hasDormantWorkerLeases() && requestId) {
+    context.caller.conversationId = acceptRequestConversation(
+      await awaitFreshCallOrigin(name, startedAt, DORMANT_HISTORY_EVIDENCE_MS, { requestId })
+    );
   }
   // Two things about liveness, both before the agent is resolved so that the answer this
   // call gets is the state this call itself established.
@@ -491,7 +558,19 @@ async function dispatchTracked(
   // back to the first approved root turns an attribution outage into wrong-project mutation.
   // Refuse and let the model retry once page evidence is healthy instead.
   const result = await runInCallContext(context, () =>
-      dormantWorker
+      callerIdentityConflict
+        ? Promise.resolve(
+            fail(
+              'CALLER_IDENTITY_CONFLICT: ChatGPT supplied contradictory caller identity evidence. No local tool was run. Reload the conversation and extension before retrying.'
+            )
+          )
+        : callerIdentityPending
+        ? Promise.resolve(
+            fail(
+              'CALLER_IDENTITY_PENDING: the connector returned without running a local tool so the browser extension can bind this exact ChatGPT request. Retry the identical call once; ambiguous or dormant-worker ownership will remain blocked.'
+            )
+          )
+        : dormantWorker
         ? Promise.resolve(fail(dormantWorker))
         : retiredWorker
         ? Promise.resolve(
@@ -526,7 +605,7 @@ async function dispatchTracked(
   // only be able to disagree with the stronger answer it waited for.
   if (!context.caller.conversationId) {
     const resolved = callerConversation(name, startedAt, requestId);
-    if (resolved) context.caller.conversationId = resolved;
+    if (resolved) context.caller.conversationId = acceptRequestConversation(resolved);
   }
   // Never erase an identity a handler proved more strongly (agents::callerNow). The old
   // post-handler pass could fail to rediscover evidence that callerNow had already reserved
@@ -819,7 +898,7 @@ export function createRegistrar(server: McpServer, ctx: ToolContext, surface: Su
       // surface declared: who is calling is a fact about the conversation, established from
       // page evidence in `dispatch`, and never something the model is asked to carry.
       server.registerTool(name, config, ((args: never, mcpCtx?: McpCallContext) =>
-        dispatch(name, args, mcpCtx?.sessionId ?? null, requestIdOf(mcpCtx), surface, () =>
+        dispatch(name, args, mcpCtx?.sessionId ?? null, requestIdOf(mcpCtx), openAiCallerOf(mcpCtx), surface, () =>
           handler(args)
         )) as never);
     },
@@ -893,6 +972,13 @@ export const DORMANT_HISTORY_EVIDENCE_CEILING_MS = 50_000;
 export const DORMANT_HISTORY_EVIDENCE_MS = evidenceWindow(
   DORMANT_HISTORY_EVIDENCE_CEILING_MS,
   process.env.CLF_DORMANT_HISTORY_EVIDENCE_MS ?? process.env.CLF_EVIDENCE_MS
+);
+
+/** One coalesced gateway replica may wait briefly for the first rendered page join. */
+export const OPENAI_BOOTSTRAP_EVIDENCE_CEILING_MS = 30_000;
+export const OPENAI_BOOTSTRAP_EVIDENCE_MS = evidenceWindow(
+  OPENAI_BOOTSTRAP_EVIDENCE_CEILING_MS,
+  process.env.CLF_OPENAI_BOOTSTRAP_EVIDENCE_MS ?? process.env.CLF_DORMANT_HISTORY_EVIDENCE_MS ?? process.env.CLF_EVIDENCE_MS
 );
 
 /**

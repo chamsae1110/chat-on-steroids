@@ -85,6 +85,7 @@ const {
 } = await import('../src/main/agents.js');
 const { startMcpServer } = await import('../src/main/mcp/server.js');
 const { DORMANT_HISTORY_EVIDENCE_CEILING_MS } = await import('../src/main/mcp/kernel.js');
+const { resetOpenAiCallerBindingsForTests } = await import('../src/main/mcp/openai-caller.js');
 const { runningToolCalls } = await import('../src/main/mcp/call-context.js');
 const { flushDurable, initDurableStore, readDurable, writeDurableNow, writeDurableSoon } = await import('../src/main/durable.js');
 const { findSessionByConversation, initSessionStore, readRecentEvents, resetSessionStoreForTests } = await import(
@@ -119,6 +120,7 @@ afterAll(async () => {
 beforeEach(() => {
   resetAgentsForTests();
   resetRecorderForTests();
+  resetOpenAiCallerBindingsForTests();
   resetWorkspaces();
   // The real app wires the broker's immediate persistence sink during startup. MCP endpoint
   // tests exercise that production contract rather than an intentionally half-wired broker;
@@ -1821,6 +1823,32 @@ describe('through the MCP endpoint', () => {
       { 'x-request-id': `${requestId}/relay` }
     );
 
+  const ordinaryAsOpenAiCaller = (
+    requestId: string,
+    session: string,
+    subject: string,
+    name: string,
+    args: Record<string, unknown>,
+    meta = false
+  ): Promise<any> =>
+    post(
+      {
+        jsonrpc: '2.0',
+        id: nextId++,
+        method: 'tools/call',
+        params: {
+          name,
+          arguments: args,
+          ...(meta ? { _meta: { 'openai/session': session, 'openai/subject': subject } } : {})
+        }
+      },
+      {
+        'x-request-id': `${requestId}/relay`,
+        'x-openai-session': session,
+        'x-openai-subject': subject
+      }
+    );
+
   const textOfReply = (reply: any): string =>
     ((reply.result?.content ?? []) as Array<{ text?: string }>).map((part) => part.text ?? '').join('\n');
 
@@ -2084,6 +2112,164 @@ describe('through the MCP endpoint', () => {
     const text = textOfReply(await pending);
     expect(text).not.toContain('CALLER_IDENTITY_REQUIRED');
     expect(text).toMatch(/unknown root|not found/i);
+  });
+
+  it('binds one official OpenAI session from exact page evidence and reuses it without another page wait', async () => {
+    startSwarm(1);
+    const worker = startWorker('worker-1');
+    finishAgent(worker.caller, 'park before a new official session calls');
+    expect(releaseQuiescentRun()).toBe(true);
+
+    const session = 'openai-session-fresh-prime';
+    const subject = 'openai-subject-user';
+    const firstRequest = 'wfr_openai_first_bind';
+    const first = await ordinaryAsOpenAiCaller(firstRequest, session, subject, 'read', { paths: ['/anything'] }, true);
+    expect(textOfReply(first)).toContain('CALLER_IDENTITY_PENDING');
+    expect(textOfReply(first)).toContain('without running a local tool');
+    await recordChatObservations('c-openai-fresh-prime', [
+      { kind: 'turn_start', time: Date.now(), turnId: 't-openai-first-bind' },
+      {
+        kind: 'tool_evidence',
+        time: Date.now(),
+        turnId: 't-openai-first-bind',
+        calls: [{ messageId: 'm-openai-first-bind', tool: 'read', order: 0, answered: false, requestId: firstRequest }]
+      }
+    ]);
+    // A new request id has no page correlation at all. The official conversation session
+    // is sufficient only because the no-execution bootstrap was joined to exact page evidence.
+    const reused = await ordinaryAsOpenAiCaller(
+      'wfr_openai_reused_without_page',
+      session,
+      subject,
+      'read',
+      { paths: ['/anything'] },
+      true
+    );
+    const text = textOfReply(reused);
+    expect(text).not.toContain('CALLER_IDENTITY_REQUIRED');
+    expect(text).toMatch(/unknown root|not found/i);
+  });
+
+  it('coalesces gateway fanout so one replica waits for page identity and only that replica executes', async () => {
+    startSwarm(1);
+    const worker = startWorker('worker-1');
+    finishAgent(worker.caller, 'park before a fanned-out prime call');
+    expect(releaseQuiescentRun()).toBe(true);
+
+    const requestId = 'wfr_openai_gateway_fanout';
+    const session = 'openai-session-gateway-fanout';
+    const subject = 'openai-subject-user';
+    const first = await ordinaryAsOpenAiCaller(requestId, session, subject, 'read', { paths: ['/anything'] });
+    expect(textOfReply(first)).toContain('CALLER_IDENTITY_PENDING');
+
+    const waiter = ordinaryAsOpenAiCaller(requestId, session, subject, 'read', { paths: ['/anything'] });
+    const duplicate = await ordinaryAsOpenAiCaller(requestId, session, subject, 'read', { paths: ['/anything'] });
+    expect(textOfReply(duplicate)).toContain('CALLER_IDENTITY_PENDING');
+    await recordChatObservations('c-openai-gateway-fanout', [
+      { kind: 'turn_start', time: Date.now(), turnId: 't-openai-gateway-fanout' },
+      {
+        kind: 'tool_evidence',
+        time: Date.now(),
+        turnId: 't-openai-gateway-fanout',
+        calls: [{ messageId: 'm-openai-gateway-fanout', tool: 'read', order: 0, answered: false, requestId }]
+      }
+    ]);
+    const executed = textOfReply(await waiter);
+    expect(executed).not.toContain('CALLER_IDENTITY_PENDING');
+    expect(executed).toMatch(/unknown root|not found/i);
+  });
+
+  it('binds an old worker official session to that worker and keeps it fenced', async () => {
+    startSwarm(1);
+    const worker = startWorker('worker-1');
+    finishAgent(worker.caller, 'park before its old session calls');
+    expect(releaseQuiescentRun()).toBe(true);
+
+    const requestId = 'wfr_openai_dormant_worker';
+    const first = await ordinaryAsOpenAiCaller(
+      requestId,
+      'openai-session-dormant-worker',
+      'openai-subject-user',
+      'read',
+      { paths: ['/anything'] }
+    );
+    expect(textOfReply(first)).toContain('CALLER_IDENTITY_PENDING');
+    await recordChatObservations('c-worker-1', [
+      { kind: 'turn_start', time: Date.now(), turnId: 't-openai-dormant-worker' },
+      {
+        kind: 'tool_evidence',
+        time: Date.now(),
+        turnId: 't-openai-dormant-worker',
+        calls: [{ messageId: 'm-openai-dormant-worker', tool: 'read', order: 0, answered: false, requestId }]
+      }
+    ]);
+    const retry = await ordinaryAsOpenAiCaller(requestId, 'openai-session-dormant-worker', 'openai-subject-user', 'read', {
+      paths: ['/anything']
+    });
+    expect(textOfReply(retry)).toContain('WORKER_SLEEPING');
+  });
+
+  it('poisons a bound official session if a later exact request belongs to another conversation', async () => {
+    startSwarm(1);
+    const worker = startWorker('worker-1');
+    finishAgent(worker.caller, 'park before contradictory exact evidence');
+    expect(releaseQuiescentRun()).toBe(true);
+
+    const session = 'openai-session-sticky-conflict';
+    const subject = 'openai-subject-user';
+    const firstRequest = 'wfr_openai_sticky_first';
+    const first = await ordinaryAsOpenAiCaller(firstRequest, session, subject, 'read', { paths: ['/anything'] });
+    expect(textOfReply(first)).toContain('CALLER_IDENTITY_PENDING');
+    await recordChatObservations('c-openai-owner-a', [
+      { kind: 'turn_start', time: Date.now(), turnId: 't-openai-owner-a' },
+      {
+        kind: 'tool_evidence',
+        time: Date.now(),
+        turnId: 't-openai-owner-a',
+        calls: [{ messageId: 'm-openai-owner-a', tool: 'read', order: 0, answered: false, requestId: firstRequest }]
+      }
+    ]);
+    const bound = await ordinaryAsOpenAiCaller(firstRequest, session, subject, 'read', { paths: ['/anything'] });
+    expect(textOfReply(bound)).toMatch(/unknown root|not found/i);
+
+    const secondRequest = 'wfr_openai_sticky_second';
+    await recordChatObservations('c-openai-owner-b', [
+      { kind: 'turn_start', time: Date.now(), turnId: 't-openai-owner-b' },
+      {
+        kind: 'tool_evidence',
+        time: Date.now(),
+        turnId: 't-openai-owner-b',
+        calls: [{ messageId: 'm-openai-owner-b', tool: 'read', order: 0, answered: false, requestId: secondRequest }]
+      }
+    ]);
+    const conflict = await ordinaryAsOpenAiCaller(secondRequest, session, subject, 'read', { paths: ['/anything'] });
+    expect(textOfReply(conflict)).toContain('CALLER_IDENTITY_CONFLICT');
+  });
+
+  it('fails closed when canonical OpenAI metadata contradicts the transport headers', async () => {
+    startSwarm(1);
+    const worker = startWorker('worker-1');
+    finishAgent(worker.caller, 'park before conflicting identity arrives');
+    expect(releaseQuiescentRun()).toBe(true);
+
+    const reply = await post(
+      {
+        jsonrpc: '2.0',
+        id: nextId++,
+        method: 'tools/call',
+        params: {
+          name: 'read',
+          arguments: { paths: ['/anything'] },
+          _meta: { 'openai/session': 'meta-session', 'openai/subject': 'same-subject' }
+        }
+      },
+      {
+        'x-request-id': 'wfr_openai_conflict/relay',
+        'x-openai-session': 'different-header-session',
+        'x-openai-subject': 'same-subject'
+      }
+    );
+    expect(textOfReply(reply)).toContain('CALLER_IDENTITY_CONFLICT');
   });
 
   it('delivers and acknowledges a parked prime inbox by exact conversation without adopting another history', async () => {
