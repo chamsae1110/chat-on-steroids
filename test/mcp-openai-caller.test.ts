@@ -9,6 +9,7 @@ import {
   openAiCallerConflicted,
   openAiHeaderEvidence,
   noteOpenAiCallerRequest,
+  observeOpenAiPageScopeCandidates,
   resetOpenAiCallerBindingsForTests,
   resolveOpenAiCallerIdentity
 } from '../src/main/mcp/openai-caller.js';
@@ -129,6 +130,23 @@ describe('OpenAI MCP caller identity', () => {
     );
     expect(conversationForOpenAiCaller(identity.key)).toBe('conversation-early-scope');
     expect(beginOpenAiCallerBootstrap(identity.key)).toBe('resolved');
+  });
+
+  it('matches one allowlisted page-model candidate without retaining alternatives', () => {
+    expect(
+      observeOpenAiPageScopeCandidates(
+        ['message-id', 'working-turn-id', 'opaque-official-session', 'parent-id'],
+        'conversation-candidates'
+      )
+    ).toBe(false);
+    const identity = resolveOpenAiCallerIdentity(
+      undefined,
+      openAiHeaderEvidence({
+        'x-openai-session': 'opaque-official-session',
+        'x-openai-subject': 'candidate-subject'
+      })
+    );
+    expect(conversationForOpenAiCaller(identity.key)).toBe('conversation-candidates');
   });
 
   it('does not substitute a different page request id for the official opaque session', () => {

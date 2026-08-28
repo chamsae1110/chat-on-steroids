@@ -2421,12 +2421,14 @@ describe('extension connection', () => {
     const reply = await worker.send({
       type: 'correlate',
       conversationId,
-      calls: [{ messageId: 'request-message', tool: 'exec_command', order: 0, answered: false, requestId }]
+      calls: [{ messageId: 'request-message', tool: 'exec_command', order: 0, answered: false, requestId }],
+      scopeCandidates: ['opaque-session-candidate']
     });
 
     expect(body).toMatchObject({
       conversationId,
-      calls: [expect.objectContaining({ requestId, messageId: 'request-message' })]
+      calls: [expect.objectContaining({ requestId, messageId: 'request-message' })],
+      scopeCandidates: ['opaque-session-candidate']
     });
     expect(reply).toMatchObject({
       ok: true,

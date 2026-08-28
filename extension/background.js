@@ -1872,9 +1872,10 @@ const HANDLERS = {
     if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
     const calls = Array.isArray(message.calls) ? message.calls : [];
     if (calls.length === 0) return { ok: false, error: 'bad_request_evidence' };
+    const scopeCandidates = Array.isArray(message.scopeCandidates) ? message.scopeCandidates : [];
     const result = await call('/correlations', {
       method: 'POST',
-      body: JSON.stringify({ conversationId, calls })
+      body: JSON.stringify({ conversationId, calls, scopeCandidates })
     });
     return ownsDocument(source) ? result : { ok: false, error: 'stale_document' };
   },

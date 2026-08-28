@@ -2213,7 +2213,7 @@
   // 6: adds request-id ownership evidence used by deterministic MCP attribution.
   // 7: keys streaming commentary and native activity by ChatGPT thought/message identity,
   //    so React row replacement, raw text UUID rotation and refresh cannot mint duplicates.
-  const FIBER_VERSION = 10;
+  const FIBER_VERSION = 11;
   const FIBER_TIMEOUT_MS = 1500;
   const FIBER_MAX_ROWS = 400;
   /** Assistant turns whose per-call evidence is accepted from one scan. */
@@ -2377,6 +2377,24 @@
       });
     }
 
+    // Exact-match candidates for the official opaque MCP session. They are carried only
+    // to the authenticated local bridge; they never enter recorder events or browser
+    // storage. Structural allowlisting happens in fiber.js and is repeated here.
+    const scopeCandidates = [];
+    const scopeSeen = new Set();
+    for (const value of (Array.isArray(raw.scopeCandidates) ? raw.scopeCandidates : []).slice(0, 256)) {
+      if (
+        typeof value !== 'string' ||
+        value.length === 0 ||
+        value.length > 512 ||
+        value.trim() !== value ||
+        /[\u0000-\u001f\u007f]/.test(value) ||
+        scopeSeen.has(value)
+      ) continue;
+      scopeSeen.add(value);
+      scopeCandidates.push(value);
+    }
+
     const messages = [];
     const messageIndex = new Map();
     const conflictingMessages = new Set();
@@ -2461,6 +2479,7 @@
       endMessageId: cap(raw.endMessageId, 200),
       calls: kept,
       requests,
+      scopeCandidates,
       messages: keptMessages,
       activities: keptActivities
     };
@@ -2629,7 +2648,7 @@
     return found;
   }
 
-  function confirmLiveRequestOwners(calls, ownerConversation) {
+  function confirmLiveRequestOwners(calls, scopeCandidates, ownerConversation) {
     if (!Array.isArray(calls) || calls.length === 0 || !ownerConversation) return;
     const byRequest = new Map();
     for (const call of calls) {
@@ -2645,7 +2664,8 @@
     void ask({
       type: 'correlate',
       conversationId: ownerConversation,
-      calls: batch
+      calls: batch,
+      scopeCandidates
     }).then((reply) => {
       const data = reply && reply.ok === true && reply.data && typeof reply.data === 'object' ? reply.data : null;
       const confirmed = new Set(data && Array.isArray(data.confirmed) ? data.confirmed : []);
@@ -2841,7 +2861,18 @@
           }
         }
       }
-      confirmLiveRequestOwners(ownerCalls, askedConversation);
+      const ownerScopes = [];
+      const ownerScopeSeen = new Set();
+      for (const turn of answer.turns) {
+        const pageConversation = concreteConversation(turn.conversationId);
+        if (turn !== ownedPageTurn && pageConversation !== askedConversation) continue;
+        for (const value of turn.scopeCandidates || []) {
+          if (ownerScopeSeen.has(value)) continue;
+          ownerScopeSeen.add(value);
+          ownerScopes.push(value);
+        }
+      }
+      confirmLiveRequestOwners(ownerCalls, ownerScopes, askedConversation);
     }
     // A terminal message can finish the local turn before ChatGPT removes a stale Stop
     // control. While that latch is active, observe() keeps Fiber probing the newest visible

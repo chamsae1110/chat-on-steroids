@@ -534,7 +534,7 @@ async function replyFiber(
     );
     window.dispatchEvent(
       new window.MessageEvent('message', {
-        data: { source: 'clf-fiber-reply', nonce: event.data.nonce, scanToken, v: 10, scanOk: true, rows, turns: indexedTurns },
+        data: { source: 'clf-fiber-reply', nonce: event.data.nonce, scanToken, v: 11, scanOk: true, rows, turns: indexedTurns },
         source: window
       })
     );
@@ -998,7 +998,7 @@ describe('naming the agent behind a row', () => {
     }));
     await replyFiber([
       {
-        v: 10,
+        v: 11,
         index: 0,
         tool: 'run_command',
         path: null,
@@ -1037,7 +1037,7 @@ describe('naming the agent behind a row', () => {
  */
 describe('the calls a row folded away', () => {
   const FOLDED = {
-    v: 10,
+    v: 11,
     index: 0,
     tool: 'run_command',
     path: '/TobisComputer/mcp/run_command',
@@ -5169,7 +5169,7 @@ describe('a page leaving the screen', () => {
  */
 describe('evidence from the page context', () => {
   const GOOD = {
-    v: 10,
+    v: 11,
     index: 0,
     tool: 'agent_status',
     path: '/TobisComputer/mcp/agent_status',
@@ -5417,6 +5417,7 @@ describe('evidence from the page context', () => {
             createTime: 1_700_000_001
           }
         ],
+        scopeCandidates: ['working-turn-scope', 'turn-exchange-scope'],
         messages: []
       }
     ]);
@@ -5427,7 +5428,8 @@ describe('evidence from the page context', () => {
     expect(handshakes).toHaveLength(1);
     expect(handshakes[0]).toMatchObject({
       conversationId,
-      calls: [expect.objectContaining({ requestId, messageId: 'fresh-request-message' })]
+      calls: [expect.objectContaining({ requestId, messageId: 'fresh-request-message' })],
+      scopeCandidates: ['working-turn-scope', 'turn-exchange-scope']
     });
     const evidence = emitted(live.sent, 'tool_evidence').map((entry) => entry.event);
     const requestEvidence = evidence.find((entry) =>
@@ -5774,7 +5776,7 @@ describe('evidence from the page context', () => {
             source: 'clf-fiber-reply',
             nonce: event.data.nonce,
             scanToken: event.data.nonce,
-            v: 10,
+            v: 11,
             scanOk: true,
             rows: [],
             turns: [
@@ -5880,7 +5882,7 @@ describe('evidence from the page context', () => {
             source: 'clf-fiber-reply',
             nonce: event.data.nonce,
             scanToken: event.data.nonce,
-            v: 10,
+            v: 11,
             scanOk: true,
             rows: [{ ...GOOD, tool: 'read' }],
             turns: []
@@ -10043,7 +10045,7 @@ describe('the goal loop', () => {
             source: 'clf-fiber-reply',
             nonce: event.data.nonce,
             scanToken,
-            v: 10,
+            v: 11,
             scanOk: true,
             rows: [],
             turns: [{
@@ -10126,7 +10128,7 @@ describe('the goal loop', () => {
             source: 'clf-fiber-reply',
             nonce: event.data.nonce,
             scanToken,
-            v: 10,
+            v: 11,
             scanOk: true,
             rows: [],
             turns: [{

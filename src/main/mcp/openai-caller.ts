@@ -129,6 +129,23 @@ function conflictPageScope(rawRequestId: string): void {
   if (caller) poison(caller);
 }
 
+/**
+ * Ephemeral page-model identity candidates from the authenticated extension.
+ * Values are immediately reduced to process-keyed HMACs and are never returned,
+ * logged, or persisted. A candidate has authority only when it is byte-identical
+ * to an official `openai/session` already seen by this process (or seen later).
+ */
+export function observeOpenAiPageScopeCandidates(
+  candidates: readonly string[],
+  conversationId: string
+): boolean {
+  let matched = false;
+  for (const candidate of candidates) {
+    if (bindPageScope(candidate, conversationId)) matched = true;
+  }
+  return matched;
+}
+
 function opaque(value: unknown, present: boolean): OpaqueField {
   if (!present) return { present: false, value: null };
   if (typeof value !== 'string' || value.length === 0 || value.length > MAX_OPAQUE_CHARS) {

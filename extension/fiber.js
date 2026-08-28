@@ -37,7 +37,7 @@
   'use strict';
 
   /** Bumped when the descriptor shape changes, so a stale pair cannot half-understand. */
-  const VERSION = 10;
+  const VERSION = 11;
   // The MAIN world survives an extension reload because the ChatGPT document survives it.
   // Recovery may therefore execute this file again in a page that still has an older helper
   // listener. Keep at most one listener for this protocol version; content.js rejects older
@@ -64,6 +64,9 @@
   const MAX_TURNS = 6;
   /** Connector requests reported for one turn. Far above any real turn's call count. */
   const MAX_CALLS = 200;
+  /** Opaque identity candidates retained only for one MAIN->isolated->app comparison. */
+  const MAX_SCOPE_CANDIDATES = 256;
+  const MAX_SCOPE_CHARS = 512;
   /** ChatGPT's own assistant turn sections, which is where a turn's message model hangs. */
   const TURN_SECTION = 'section[data-testid^="conversation-turn"]';
   /** ChatGPT-rendered authored prose. Tool rows and this extension's own surfaces are excluded. */
@@ -873,6 +876,65 @@
     return out;
   }
 
+  /**
+   * Provider-authored opaque identities that may name the official MCP session.
+   *
+   * The browser does not know which one, if any, equals `_meta["openai/session"]`.
+   * It therefore sends only this fixed structural allowlist to the local app, where each
+   * value is immediately reduced to a process-keyed HMAC and compared for exact equality.
+   * These values are never transcript data, never persisted, and never grant authority by
+   * key name, timing, active tab, or proximity. A mismatch is simply discarded.
+   */
+  function scopeCandidatesOf(fiber, messages) {
+    const out = [];
+    const seen = new Set();
+    const remember = (value) => {
+      if (
+        typeof value !== 'string' ||
+        value.length === 0 ||
+        value.length > MAX_SCOPE_CHARS ||
+        value.trim() !== value ||
+        /[\u0000-\u001f\u007f]/.test(value) ||
+        seen.has(value) ||
+        out.length >= MAX_SCOPE_CANDIDATES
+      ) return;
+      seen.add(value);
+      out.push(value);
+    };
+    for (const message of Array.isArray(messages) ? messages : []) {
+      if (!message || typeof message !== 'object') continue;
+      remember(message.id);
+      remember(message.parent_id);
+      const meta = message.metadata && typeof message.metadata === 'object' ? message.metadata : null;
+      if (!meta) continue;
+      remember(meta.request_id);
+      remember(meta.parent_id);
+      remember(meta.working_turn_id);
+      remember(meta.turn_exchange_id);
+      remember(meta.conversation_id);
+      remember(meta.client_thread_id);
+      remember(meta.session_id);
+    }
+    let at = fiber;
+    for (let up = 0; at && up < MAX_CLIMB; up++, at = at.return) {
+      const props = at.memoizedProps;
+      if (!props || typeof props !== 'object') continue;
+      remember(props.serverThreadId);
+      remember(props.urlThreadId);
+      remember(props.clientThreadId);
+      remember(props.conversationId);
+      const turn = props.turn && typeof props.turn === 'object' ? props.turn : null;
+      if (!turn) continue;
+      remember(turn.id);
+      remember(turn.turnId);
+      remember(turn.serverThreadId);
+      remember(turn.urlThreadId);
+      remember(turn.clientThreadId);
+      remember(turn.conversationId);
+    }
+    return out;
+  }
+
   /** "/Chat On Steroids Core/link_…/read" -> "read", or null if that is not a name. */
   function toolName(value) {
     if (typeof value !== 'string' || value.length === 0) return null;
@@ -1122,6 +1184,7 @@
         const messages = turnMessagesOf(fiber);
         const calls = callsOf(messages);
         const requests = requestIdsOf(messages);
+        const scopeCandidates = scopeCandidatesOf(fiber, messages);
         const turnBudget = { remaining: Math.min(MAX_TURN_TEXT, responseBudget.remaining) };
         const before = turnBudget.remaining;
         const renderedMessages = renderedMessagesOf(group.sections, messages, turnBudget);
@@ -1143,6 +1206,7 @@
           endMessageId: turnEndMessageId(messages),
           calls,
           requests,
+          scopeCandidates,
           messages: renderedMessages,
           activities
         };
